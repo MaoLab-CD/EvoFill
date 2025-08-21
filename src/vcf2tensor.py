@@ -1,142 +1,191 @@
-#!/usr/bin/env python3
-"""
-vcf2tensor.py
-一次性完成：索引生成 → 分块转换
-"""
 import os
-import math
+import random
 import numpy as np
 import torch
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from cyvcf2 import VCF
 from pyfaidx import Fasta
-from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
-from src.utils import load_config
+from pathlib import Path
 
-# -------------------------------------------------
-# 0. 参数
-# -------------------------------------------------
-args = load_config("config/config.json")
 
-# -------------------------------------------------
-# 1. 全局常量
-# -------------------------------------------------
-BASE2INT = {'A': 1, 'C': 2, 'G': 3, 'T': 4,
-            'a': 1, 'c': 2, 'g': 3, 't': 4,
-            'N': 0, 'n': 0}
+def base2int(base):
+    """碱基字符编码: A->0, C->1, G->2, T->3, N或其他->4, 缺失用5。"""
+    base = base.upper()
+    if base == 'A':
+        return 0
+    elif base == 'C':
+        return 1
+    elif base == 'G':
+        return 2
+    elif base == 'T':
+        return 3
+    elif base == '.':  # 缺失标记
+        return 5
+    else:
+        return 4  # N 或其他
 
-def seq_to_int(seq: str):
-    return [BASE2INT.get(b, 0) for b in seq]
 
-def fetch_seq_and_mask(fa, chrom: str, pos: int, k: int, snp_offset: int = 0):
-    half = k // 2
-    start = pos - half - 1 + snp_offset
-    end   = pos + half + snp_offset
-    try:
-        seq = fa[chrom][start:end].seq
-    except KeyError:
-        seq = 'N' * k
-    if len(seq) != k:
-        seq = 'N' * k
-    mask = [0] * k
-    mask[half + snp_offset] = 1
-    return seq_to_int(seq), mask
-
-# -------------------------------------------------
-# 2. 生成位点索引
-# -------------------------------------------------
-def build_pos_index(vcf_path, tsv_path):
-    print(f"[index] 生成位点索引 {tsv_path} ...")
+def count_index(vcf_path):
+    """生成位点索引，返回 variant_idx 和 sample_idx"""
     vcf = VCF(vcf_path)
-    with open(tsv_path, 'w') as fo:
-        for idx, rec in enumerate(vcf, 1):
-            fo.write(f"{idx}\t{rec.CHROM}\t{rec.POS}\n")
+    sample_idx = vcf.samples
+    variant_idx = sum(1 for _ in vcf)  # 计算总变异位点数
     vcf.close()
-    return idx
+    return variant_idx, sample_idx
 
-# -------------------------------------------------
-# 3. 单块转换
-# -------------------------------------------------
-def process_one_block(parms):
-    n0, n1, s0, s1, sub_samples, S_all, stage, stage_vcf, stage_fasta, stage_pos_tsv, stage_chunks_dir = parms
-    # 1. 读取位点列表
-    block_vars = []
-    with open(stage_pos_tsv) as f:
-        for line in f:
-            idx, chrom, pos = line.rstrip().split('\t')
-            idx = int(idx)
-            if s0 <= idx <= s1:
-                block_vars.append((chrom, int(pos)))
-    S_blk = len(block_vars)
-    N_blk = n1 - n0
 
-    # 2. 开 VCF 与 fasta
-    vcf = VCF(stage_vcf, gts012=True, samples=sub_samples)
-    fa  = Fasta(stage_fasta, one_based_attributes=False)
-
-    seq   = torch.empty(N_blk, S_blk, args.k_mer, dtype=torch.int8)
-    mask  = torch.empty(N_blk, S_blk, args.k_mer, dtype=torch.bool)
-    label = torch.empty(N_blk, S_blk, dtype=torch.int8)
-
-    vcf_iter = iter(vcf)
-    for s, (chrom, pos) in enumerate(block_vars):
-        snp_offset = np.random.randint(args.k_mer // 10, args.k_mer // 2)
-        seq_s, mask_s = fetch_seq_and_mask(fa, chrom, pos, args.k_mer, snp_offset)
-        seq[:, s]  = torch.tensor(seq_s,  dtype=torch.int8)
-        mask[:, s] = torch.tensor(mask_s, dtype=torch.bool)
-
-        rec = next(vcf_iter)
-        gts_sum = rec.genotype.array().sum(axis=1, dtype=np.int8)[n0:n1]
-        label[:, s] = torch.from_numpy(gts_sum)
-
-    chunk_id = f"{(n0 // args.n_chunk) * math.ceil(S_all / args.s_chunk) + (s0 - 1) // args.s_chunk + 1:05d}"
-    out_path = os.path.join(stage_chunks_dir, f"{stage}_{chunk_id}.pt")
-    torch.save({'seq': seq, 'mask': mask, 'label': label}, out_path)
-    vcf.close()
-    return out_path
-
-# -------------------------------------------------
-# 4. 主流程
-# -------------------------------------------------
-def run_stage(stage: str):
+def process_one_chunk(args):
     """
-    stage: 'train' or 'val'
+    每个子进程只干一件事：处理一个 chunk。
+    进度条写入 {output_dir}/chunk_{chunk_id}.log
     """
-    print(f"\n========== {stage.upper()} SET ==========")
+    (chunk_id,
+     chunk_samples,
+     sample_idx,
+     vcf_file,
+     ref_fa,
+     k,
+     min_adj_len,
+     output_dir,
+     seed) = args
 
-    stage_vcf          = getattr(args, f"{stage}_vcf")
-    stage_chunks_dir   = getattr(args, f"{stage}_chunks_dir")
-    stage_pos_tsv      = os.path.join(stage_chunks_dir, f"{stage}_pos.tsv")
+    # 每个进程独立随机种子
+    random.seed(seed + chunk_id)
 
-    os.makedirs(stage_chunks_dir, exist_ok=True)
+    # 把进度条写到独立文件，防止冲突
+    log_path = Path(output_dir) / f'chunk_{chunk_id}.log'
+    tqdm_kwargs = dict(file=open(log_path, 'w'), mininterval=2.0)
 
-    # 第 1 步：索引
-    S_all = build_pos_index(stage_vcf, stage_pos_tsv)
+    # 一次性读整条染色体进内存，见上次优化
+    ref = Fasta(ref_fa, sequence_always_upper=True)
+    chrom_cache = {c: ref[c][:].seq for c in ref.keys()}
 
-    # 第 2 步：分块
-    vcf = VCF(stage_vcf)
-    sample_names = vcf.samples
+    vcf = VCF(vcf_file)
+    sample_indices = [sample_idx.index(s) for s in chunk_samples]
+
+    # 先数变异总数（很快）
+    total_vars = sum(1 for _ in VCF(vcf_file))
+    vcf = VCF(vcf_file)  # reopen
+
+    sample_data = {s: [] for s in chunk_samples}
+    for variant in tqdm(vcf, total=total_vars, desc=f'Chunk{chunk_id}', **tqdm_kwargs):
+        chrom = 'chr' + str(variant.CHROM)
+        pos = variant.POS
+        ref_allele = variant.REF
+        alt_alleles = variant.ALT
+        ref_len = len(ref_allele)
+
+        seq_source = chrom_cache[chrom]
+        seq_len = len(seq_source)
+
+        for local_idx, s in enumerate(chunk_samples):
+            gt = variant.genotypes[sample_indices[local_idx]]
+            if gt is None or len(gt) != 3 or all(a == -1 for a in gt[:2]):
+                haplotypes = [None, None]
+            else:
+                haplotypes = [gt[0] if gt[0] != -1 else None, gt[1] if gt[1] != -1 else None]
+
+            for hap_idx, hap in enumerate(haplotypes):
+                if hap is None:
+                    allele = '.' * ref_len
+                elif hap == 0:
+                    allele = ref_allele
+                else:
+                    allele_idx = hap - 1
+                    if 0 <= allele_idx < len(alt_alleles):
+                        allele = alt_alleles[allele_idx]
+                    else:
+                        allele = ref_allele
+
+                allele = allele.upper()
+                allele_len = len(allele)
+
+                min_start = min_adj_len
+                max_start = k - allele_len - min_adj_len
+                if max_start < min_start:
+                    variant_start = min_start
+                else:
+                    variant_start = random.randint(min_start, max_start)
+
+                upstream_len = variant_start
+                downstream_len = k - variant_start - allele_len
+
+                ref_up_start = pos - 1 - upstream_len
+                pad_up = max(0, -ref_up_start)
+                actual_up_start = max(0, ref_up_start)
+                upstream = 'N' * pad_up + seq_source[actual_up_start:pos - 1]
+
+                end = pos - 1 + ref_len
+                ref_down_end = end + downstream_len
+                actual_down_end = min(ref_down_end, seq_len)
+                downstream = seq_source[end:actual_down_end] + 'N' * (ref_down_end - actual_down_end)
+
+                sequence = upstream + allele + downstream
+
+                current_len = len(sequence)
+                if current_len != k:
+                    if current_len < k:
+                        sequence += 'N' * (k - current_len)
+                    else:
+                        sequence = sequence[:k]
+
+                seq_encoded = np.array([base2int(b) for b in sequence], dtype=np.uint8)
+                mask = np.zeros(k, dtype=np.uint8)
+                mask_end = min(k, variant_start + allele_len)
+                mask[variant_start:mask_end] = 1
+
+                sample_data[s].append({'seq': seq_encoded, 'mask': mask})
+
     vcf.close()
-    N_all = len(sample_names)
 
-    tasks = []
-    for n0 in range(0, N_all, args.n_chunk):
-        n1 = min(n0 + args.n_chunk, N_all)
-        sub_samples = sample_names[n0:n1]
-        for s0 in range(1, S_all + 1, args.s_chunk):
-            s1 = min(s0 + args.s_chunk - 1, S_all)
-            tasks.append((n0, n1, s0, s1, sub_samples, S_all,
-                          stage, stage_vcf, args.ref_fasta,
-                          stage_pos_tsv, stage_chunks_dir))
+    # 组装成 tensor 并保存
+    seq_list = [np.stack([d['seq'] for d in sample_data[s]]) for s in chunk_samples]
+    mask_list = [np.stack([d['mask'] for d in sample_data[s]]) for s in chunk_samples]
+    torch.save(
+        {'seq': torch.from_numpy(np.stack(seq_list)),
+         'mask': torch.from_numpy(np.stack(mask_list))},
+        Path(output_dir) / f'chunk_{chunk_id}.pt'
+    )
+    return f'chunk_{chunk_id} done'
 
-    print(f"[convert] 开始转换：{len(tasks)} 个块，进程={args.jobs}")
-    with ProcessPoolExecutor(max_workers=args.jobs) as pool:
-        list(tqdm(pool.map(process_one_block, tasks), total=len(tasks)))
 
-def main():
-    for stage in ('train', 'val'):
-        run_stage(stage)
-    print("\n全部完成。")
+def vcf2tensor_parallel(vcf_file, ref_fa, k=64, min_adj_len=0, chunk_size=10, seed=42, output_dir='output_chunks', max_workers=None):
+    """并行处理 VCF 文件"""
+    os.makedirs(output_dir, exist_ok=True)
 
-if __name__ == '__main__':
-    main()
+    # 先建位点索引
+    variant_idx, sample_idx = count_index(vcf_file)
+    print(f"Processing {len(sample_idx)} Samples with {variant_idx} variant sites...")
+
+    # 构造任务列表
+    tasks = [(chunk_id,
+              sample_idx[chunk_start:chunk_start+chunk_size],
+              sample_idx,
+              vcf_file,
+              ref_fa,
+              k,
+              min_adj_len,
+              output_dir,
+              seed)
+             for chunk_id, chunk_start in enumerate(range(0, len(sample_idx), chunk_size))]
+
+    # 并行执行
+    with ProcessPoolExecutor(max_workers=max_workers) as exe:
+            future_to_chunk = {exe.submit(process_one_chunk, t): t[0] for t in tasks}
+            for future in tqdm(as_completed(future_to_chunk), total=len(tasks), desc="Processing chunks"):
+                chunk_id = future_to_chunk[future]
+                print(f"Chunk {chunk_id} done")
+
+
+if __name__ == "__main__":
+    vcf2tensor_parallel(
+        'data/hg19_chr22/chr22_train.vcf.gz',
+        'data/hg19_chr22/chr22.fa.gz',
+        k=64,
+        min_adj_len=10,
+        chunk_size=10,
+        seed=42,
+        output_dir='data/train',
+        max_workers=16 # 内存受限
+    )
