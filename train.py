@@ -185,7 +185,10 @@ def main():
                           batch_size=engine.train_micro_batch_size_per_gpu(),
                           num_workers=4,
                           pin_memory=True)
-
+    test_loader = DataLoader(train_ds,
+                            batch_size=engine.train_micro_batch_size_per_gpu(),
+                            num_workers=4,
+                            shuffle=False)
     val_loader = DataLoader(val_ds,
                           batch_size=engine.train_micro_batch_size_per_gpu(),
                           num_workers=4,
@@ -212,16 +215,10 @@ def main():
 
         # -------- test (train set)  --------
         model.eval()
-        test_loader = DataLoader(train_ds,
-                                 batch_size=engine.train_micro_batch_size_per_gpu(),
-                                 shuffle=False)
         acc = run_test(engine, test_loader, cfg, mask=True)
         print(f'Epoch {epoch} train-set mask acc {acc:.4f}')
 
         # -------- val --------
-        val_loader = DataLoader(val_ds,
-                                batch_size=engine.train_micro_batch_size_per_gpu(),
-                                shuffle=False)
         acc = run_test(engine, val_loader, cfg, mask=True)
         print(f'Epoch {epoch} val-set mask acc {acc:.4f}')
 
