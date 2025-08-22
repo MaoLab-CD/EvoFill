@@ -1,3 +1,15 @@
+# #!/usr/bin python
+# -*- coding: utf-8 -*-
+'''
+@File    :   vcf2tensor.py
+@Time    :   2025/08/21 17:53:00
+@Author  :   qmtang
+@Version :   2.0
+@Desc    :   读取VCF文件转为Pytorch张量（B,N,K）。
+             B=样本数, N=位点数, K=位点毗邻序列长度。
+             {'seq':Int(B,N,K),'mask':Bool(B,N,K)}
+'''
+
 import os
 import random
 import numpy as np
@@ -7,6 +19,8 @@ from cyvcf2 import VCF
 from pyfaidx import Fasta
 from tqdm import tqdm
 from pathlib import Path
+
+from src.utils import load_config
 
 
 def base2int(base):
@@ -37,8 +51,8 @@ def count_index(vcf_path):
 
 def process_one_chunk(args):
     """
-    每个子进程只干一件事：处理一个 chunk。
-    进度条写入 {output_dir}/chunk_{chunk_id}.log
+    每个子进程只处理一个 chunk。
+    进度写入 {output_dir}/chunk_{chunk_id}.log
     """
     (chunk_id,
      chunk_samples,
@@ -57,14 +71,14 @@ def process_one_chunk(args):
     log_path = Path(output_dir) / f'chunk_{chunk_id}.log'
     tqdm_kwargs = dict(file=open(log_path, 'w'), mininterval=2.0)
 
-    # 一次性读整条染色体进内存，见上次优化
+    # 一次性读整条染色体进内存
     ref = Fasta(ref_fa, sequence_always_upper=True)
     chrom_cache = {c: ref[c][:].seq for c in ref.keys()}
 
     vcf = VCF(vcf_file)
     sample_indices = [sample_idx.index(s) for s in chunk_samples]
 
-    # 先数变异总数（很快）
+    # 变异总数
     total_vars = sum(1 for _ in VCF(vcf_file))
     vcf = VCF(vcf_file)  # reopen
 
@@ -143,8 +157,9 @@ def process_one_chunk(args):
     seq_list = [np.stack([d['seq'] for d in sample_data[s]]) for s in chunk_samples]
     mask_list = [np.stack([d['mask'] for d in sample_data[s]]) for s in chunk_samples]
     torch.save(
-        {'seq': torch.from_numpy(np.stack(seq_list)),
-         'mask': torch.from_numpy(np.stack(mask_list))},
+        {'sample':chunk_samples,
+        'seq': torch.from_numpy(np.stack(seq_list)),
+        'mask': torch.from_numpy(np.stack(mask_list))},
         Path(output_dir) / f'chunk_{chunk_id}.pt'
     )
     return f'chunk_{chunk_id} done'
@@ -174,18 +189,30 @@ def vcf2tensor_parallel(vcf_file, ref_fa, k=64, min_adj_len=0, chunk_size=10, se
     with ProcessPoolExecutor(max_workers=max_workers) as exe:
             future_to_chunk = {exe.submit(process_one_chunk, t): t[0] for t in tasks}
             for future in tqdm(as_completed(future_to_chunk), total=len(tasks), desc="Processing chunks"):
-                chunk_id = future_to_chunk[future]
-                print(f"Chunk {chunk_id} done")
+                future_to_chunk[future]
 
 
 if __name__ == "__main__":
+    cfg = load_config("config/config.json")
+    print("Processing training set...")
     vcf2tensor_parallel(
-        'data/hg19_chr22/chr22_train.vcf.gz',
-        'data/hg19_chr22/chr22.fa.gz',
-        k=64,
-        min_adj_len=10,
-        chunk_size=10,
-        seed=42,
-        output_dir='data/train',
-        max_workers=16 # 内存受限
+        cfg.data.train_vcf,
+        cfg.data.ref_fasta,
+        k = cfg.data.k_mer,
+        min_adj_len = 10,
+        chunk_size = 10,
+        seed = 42,
+        output_dir = cfg.train_chunks_dir,
+        max_workers = 16 # 内存受限
+    )
+    print("Processing validation set...")
+    vcf2tensor_parallel(
+        cfg.data.val_vcf,
+        cfg.data.ref_fasta,
+        k = cfg.data.k_mer,
+        min_adj_len = 10,
+        chunk_size = 10,
+        seed = 42,
+        output_dir = cfg.data.val_chunks_dir,
+        max_workers = 16 # 内存受限
     )

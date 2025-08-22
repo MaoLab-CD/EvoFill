@@ -1,107 +1,235 @@
-#!/usr/bin/env python
-# deepspeed train.py --deepspeed config/ds_config.json
-import os, json, math, torch, deepspeed, torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader
+# #!/usr/bin/env python
+# -*- coding: utf-8 -*-
+'''
+@File    :   train.py
+@Time    :   2025/08/22 15:56:54
+@Author  :   qmtang
+@Version :   1.0
+@Desc    :   None
+
+deepspeed train.py
+
+'''
+
+import os
+import json
+import random
+import torch
+import deepspeed
+import pandas as pd
+import torch.nn.functional as F
+import torch.distributed as torch_dist
+from torch.utils.data import IterableDataset,DataLoader, get_worker_info
+
 from src.model import EvoFill
 from src.utils import load_config
 
-# ---------- 数据集 -----------
-class ChunkDataset(Dataset):
-    def __init__(self, root_dir: str):
-        import glob
-        self.files = sorted(glob.glob(os.path.join(root_dir, "*.pt")))
-        if not self.files:
-            raise FileNotFoundError(f"No *.pt found in {root_dir}")
-    def __len__(self):   return len(self.files)
-    def __getitem__(self, idx):
-        d = torch.load(self.files[idx])
-        return d["seq"].long(), d["mask"].bool(), d["label"].long()
 
-# ---------- 单 epoch -----------
-def run_one_epoch(model, engine, loader, is_train, mask_center_prob: float):
-    model.train(is_train)
-    tot = corr = loss_sum = 0
-    for seq, mask, label in loader:
-        seq, mask, label = (x.to(engine.device, non_blocking=True) for x in (seq, mask, label))
-        B, N, K = seq.shape
+# --------------------------------------------------
+# 工具
+# --------------------------------------------------
+def set_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
 
-        # 随机遮盖
-        if mask_center_prob > 0:
-            flat = mask.view(-1)
-            idx  = flat.nonzero(as_tuple=False).squeeze(-1)
-            n_mask = int(idx.numel() * mask_center_prob)
-            if n_mask:
-                flat[idx[torch.randperm(idx.size(0), device=seq.device)[:n_mask]]] = 0
-                mask = flat.view(B, N, K)
 
-        tgt = seq.masked_fill(~mask, 0)
-        logits = model(tgt)                       # (B, N, K, V)
-        logits_m = logits[mask]                   # (M, V)
-        label_m  = label.view(-1).repeat_interleave(K)[mask.view(-1)]
+class ChunkDataset(IterableDataset):
+    """
+    按需读取：每个 epoch 会遍历所有 chunk → 所有样本对 → 所有位点窗口
+    """
+    def __init__(self, chunks_dir, dismat_path, cfg):
+        super().__init__()
+        self.chunks_dir = chunks_dir
+        self.chunk_files = sorted([os.path.join(chunks_dir, f)
+                                   for f in os.listdir(chunks_dir) if f.endswith('.pt')])
+        self.cfg = cfg
+        self.k = cfg.data.k_mer
+        self.n_var = cfg.model.n_var
 
-        loss = torch.nn.functional.cross_entropy(logits_m, label_m, reduction='sum')
-        if is_train:
-            engine.backward(loss)
-            engine.step()
+        # 只读距离矩阵
+        dismat = pd.read_csv(dismat_path, sep='\t', skiprows=[0], header=None, index_col=0)
+        samples = [s.strip(' ') for s in dismat.index]
+        dismat.index = dismat.columns = samples
+        self.dismat = dismat
 
-        with torch.no_grad():
-            loss_sum += loss.item()
-            corr  += (logits_m.argmax(-1) == label_m).sum().item()
-            tot   += label_m.numel()
-    return loss_sum/max(tot,1), corr/max(tot,1)
+    def _iter_single_chunk(self, chunk_path):
+        """给定 chunk，产生所有 (seq1, seq2, mask1, mask2, dist)"""
+        chunk = torch.load(chunk_path)
+        names = [s.strip(' ') for s in chunk['sample']]
+        seqs  = chunk['seq']   # (B, N, k)
+        masks = chunk['mask']  # (B, N, k)
+        B, N = seqs.shape[0], seqs.shape[1]
 
-# ---------- 主入口 -----------
+        for i in range(B):
+            for j in range(i + 1, B):
+                dist = float(self.dismat.loc[names[i], names[j]])
+                for pos in range(0, N - self.n_var + 1):
+                    yield (
+                        seqs[i, pos:pos + self.n_var, :].long(),
+                        seqs[j, pos:pos + self.n_var, :].long(),
+                        masks[i, pos:pos + self.n_var, :].float(),
+                        masks[j, pos:pos + self.n_var, :].float(),
+                        dist
+                    )
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        if worker_info is None:
+            # 单进程：遍历所有 chunk
+            chunk_ids = range(len(self.chunk_files))
+        else:
+            # 多进程：按 worker 切分 chunk
+            per_worker = len(self.chunk_files) // worker_info.num_workers
+            wid = worker_info.id
+            start = wid * per_worker
+            end = (wid + 1) * per_worker if wid != worker_info.num_workers - 1 \
+                else len(self.chunk_files)
+            chunk_ids = range(start, end)
+
+        for cid in chunk_ids:
+            yield from self._iter_single_chunk(self.chunk_files[cid])
+
+# --------------------------------------------------
+# 掩码函数
+# --------------------------------------------------
+def mask_tokens(mask, ratio):
+    """
+    mask : (n_var, k)  原始 0/1 指示变异位点
+    ratio: 掩盖比例
+    返回:
+        masked : bool (n_var, k)  True 表示需要预测的位置
+    """
+    cand = (mask == 1).nonzero(as_tuple=False)          # (M,2)
+    n_keep = max(1, int(len(cand) * (1-ratio)))
+    idx = torch.randperm(len(cand))[:n_keep]
+    keep = torch.zeros_like(mask, dtype=bool)
+    keep[cand[idx][:,0], cand[idx][:,1]] = True
+    return (~keep) & (mask.bool())     # True=需要预测
+
+
+# --------------------------------------------------
+# 测试 / 验证通用
+# --------------------------------------------------
+@torch.no_grad()
+def run_test(engine, loader, cfg, mask=False):
+    correct = total = 0
+    for s1, s2, m1, m2, dist in loader:
+        s1, s2, m1, m2, dist = [x.to(engine.device) for x in (s1, s2, m1, m2, dist)]
+        logits1, logits2 = engine(s1, s2, m1, m2, dist)
+
+        if mask:           # 只计算被掩盖位置的准确率
+            mask1 = mask_tokens(m1[0], cfg.model.mask_ratio).unsqueeze(0)   # (1,n_var,k)
+            mask2 = mask_tokens(m2[0], cfg.model.mask_ratio).unsqueeze(0)
+        else:              # 全部 token
+            mask1 = mask2 = None
+
+        for logits, seq, msk in [(logits1, s1, mask1), (logits2, s2, mask2)]:
+            if mask:
+                idx = msk.view(-1)
+                logits = logits.view(-1, cfg.model.vocab_size)[idx]
+                seq    = seq.view(-1)[idx]
+            else:
+                logits = logits.view(-1, cfg.model.vocab_size)
+                seq    = seq.view(-1)
+
+            if logits.numel() == 0:
+                continue
+            pred = logits.argmax(-1)
+            correct += (pred == seq).sum().item()
+            total   += seq.numel()
+    return correct / max(total, 1)
+
+
+# --------------------------------------------------
+# 主程序
+# --------------------------------------------------
 def main():
-    cfg = load_config("config/config.json")
-    with open(cfg.deepspeed_config) as f:
-        ds_cfg = json.load(f)
+    cfg = load_config('config/config.json')
+    ds_cfg = json.load(open('config/ds_config.json'))
 
-    # 根据实际 GPU 数量自动调整梯度累计步数
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    desired_global_batch = ds_cfg.get("global_batch_size", 256)   # 全局 batch 目标
-    micro_per_gpu        = ds_cfg.get("micro_batch_per_gpu", 4)   # 每张卡 micro-batch
-    # 计算累计步数 = ceil( 目标global / (卡数*micro) )
-    grad_acc_steps = max(1, math.ceil(desired_global_batch / (world_size * micro_per_gpu)))
-    ds_cfg["gradient_accumulation_steps"] = grad_acc_steps
-    ds_cfg["train_micro_batch_size_per_gpu"] = micro_per_gpu
-    if dist.get_rank() == 0:
-        print(f"[INFO] world_size={world_size}, "
-              f"micro_batch_per_gpu={micro_per_gpu}, "
-              f"gradient_accumulation_steps={grad_acc_steps}, "
-              f"=> global_batch={world_size*micro_per_gpu*grad_acc_steps}")
+    os.environ['TORCH_CUDA_ARCH_LIST']='90'
+    set_seed(cfg.train.seed)
 
     model = EvoFill(
-        vocab_size=cfg.vocab_size,
-        d_model=cfg.d_model,
-        n_heads=cfg.n_heads,
-        n_layers=cfg.n_layers,
-        k=cfg.k_mer
+        vocab_size=cfg.model.vocab_size,
+        d_model=cfg.model.d_model,
+        n_layer=cfg.model.n_layer,
+        n_heads=cfg.model.n_heads,
+        dropout=cfg.model.dropout,
+        k=cfg.data.k_mer
     )
 
-    engine, _, _, _ = deepspeed.initialize(
+    train_ds = ChunkDataset(cfg.data.train_chunks_dir,
+                            cfg.data.train_dismat,
+                            cfg)
+    val_ds   = ChunkDataset(cfg.data.val_chunks_dir,
+                            cfg.data.val_dismat,
+                            cfg)
+
+    # DeepSpeed 会自动切分 batch
+    engine, optimizer, _, _ = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
         config=ds_cfg
     )
+    
+    # 根据单卡 batch 自动计算全局 batch
+    world_size = torch_dist.get_world_size()
+    ds_cfg["train_batch_size"] = (
+        ds_cfg["train_micro_batch_size_per_gpu"] *
+        ds_cfg["gradient_accumulation_steps"] *
+        world_size
+    )
 
-    train_ds = ChunkDataset(cfg.train_chunks_dir)
-    val_ds   = ChunkDataset(cfg.val_chunks_dir)
-    # 注意：batch_size=None，因为 DeepSpeed 的 DataLoader 自己按 micro-batch 分发
-    train_loader = DataLoader(train_ds, batch_size=None, shuffle=True, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=None, pin_memory=True)
+    train_loader = DataLoader(train_ds,
+                          batch_size=engine.train_micro_batch_size_per_gpu(),
+                          num_workers=4,
+                          pin_memory=True)
 
-    os.makedirs(cfg.save_dir, exist_ok=True)
-    for epoch in range(cfg.epochs):
-        tr_loss, tr_acc = run_one_epoch(model, engine, train_loader, True, 0.0)
-        tr_loss_m, tr_acc_m = run_one_epoch(model, engine, train_loader, True, cfg.mask_ratio)
-        val_loss, val_acc   = run_one_epoch(model, engine, val_loader,   False, cfg.mask_ratio)
-        if engine.local_rank == 0:
-            print(f"Epoch {epoch:02d}: "
-                  f"tr_loss={tr_loss:.4f} tr_acc={tr_acc:.4f} | "
-                  f"tr_loss_m={tr_loss_m:.4f} tr_acc_m={tr_acc_m:.4f} | "
-                  f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
-            if (epoch+1)%5==0 or epoch+1==cfg.epochs:
-                engine.save_checkpoint(cfg.save_dir, tag=f"ep{epoch}")
+    val_loader = DataLoader(val_ds,
+                          batch_size=engine.train_micro_batch_size_per_gpu(),
+                          num_workers=4,
+                          pin_memory=True)
+    global_step = 0
 
-if __name__ == "__main__":
+    # --------------------------------------------------
+    # 训练
+    # --------------------------------------------------
+    for epoch in range(cfg.train.epochs):
+        # -------- train --------
+        model.train()
+        for s1, s2, m1, m2, dist in train_loader:
+            s1, s2, m1, m2, dist = [x.to(engine.device) for x in (s1, s2, m1, m2, dist)]
+            logits1, logits2 = engine(s1, s2, m1, m2, dist)
+            # 所有 token 都参与 loss
+            loss = F.cross_entropy(logits1.view(-1, cfg.model.vocab_size), s1.view(-1)) + \
+                   F.cross_entropy(logits2.view(-1, cfg.model.vocab_size), s2.view(-1))
+            engine.backward(loss)
+            engine.step()
+            global_step += 1
+            if global_step % cfg.train.log_every == 0:
+                print(f'Epoch {epoch} step {global_step} loss {loss.item():.4f}')
+
+        # -------- test (train set)  --------
+        model.eval()
+        test_loader = DataLoader(train_ds,
+                                 batch_size=engine.train_micro_batch_size_per_gpu(),
+                                 shuffle=False)
+        acc = run_test(engine, test_loader, cfg, mask=True)
+        print(f'Epoch {epoch} train-set mask acc {acc:.4f}')
+
+        # -------- val --------
+        val_loader = DataLoader(val_ds,
+                                batch_size=engine.train_micro_batch_size_per_gpu(),
+                                shuffle=False)
+        acc = run_test(engine, val_loader, cfg, mask=True)
+        print(f'Epoch {epoch} val-set mask acc {acc:.4f}')
+
+        # 保存
+        if (epoch + 1) % cfg.train.save_every == 0:
+            engine.save_checkpoint('ckpts', tag=f'ep{epoch}')
+
+
+# --------------------------------------------------
+if __name__ == '__main__':
     main()
