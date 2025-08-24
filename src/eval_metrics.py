@@ -18,6 +18,7 @@ import pandas as pd
 from collections import defaultdict
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 def load_gt_matrix(vcf_path):
     vcf = pysam.VariantFile(vcf_path)
