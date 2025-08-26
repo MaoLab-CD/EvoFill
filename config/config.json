@@ -1,13 +1,11 @@
 {
   "data": {
-    "ref_fasta" : "data/hg19_chr22/chr22.fa.gz",
+    "out_dir": "data",
     "train_vcf"   : "data/hg19_chr22/chr22_train.vcf.gz",
-    "train_chunks_dir": "data/train",
     "train_dismat" : "data/hg19_chr22/chr22_train.p_dis.mat",
     "val_vcf"   : "data/hg19_chr22/chr22_val.vcf.gz",
-    "val_chunks_dir": "data/val",
     "val_dismat" : "data/hg19_chr22/chr22_val.p_dis.mat",
-    "k_mer": 64
+    "tihp": 1
   },
   "model": {
     "vocab_size": 5,
