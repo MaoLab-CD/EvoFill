@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 transform vcf to tensor in stici with p-distance
-完全沿用 STICI 的 depth 计算策略：
-1) 训练集一次性统计所有基因型 → depth
-2) 验证集用同一 depth 编码
-3) 训练/验证完全隔离（各读各的 vcf + dismat）
+Input: .vcf.gz, dismat.tsv
+Ouput:
+.pt files = Dict{'var_site' = Tensor(n_samples, n_sites, n_depth),
+                'p_dis' = Tensor(n_samples, n_samples)}
 """
 import os
 import numpy as np
@@ -105,3 +105,9 @@ if __name__ == "__main__":
     torch.save({'var_site': var_val, 'p_dis': torch.from_numpy(dis_val)},
                os.path.join(cfg.data.out_dir, "val.pt"))
     print(f"Saved val.pt   | var_site={tuple(var_val.shape)}")
+
+# Parsing VCF: 100%|██████████| 1103547/1103547 [18:24<00:00, 999.16it/s] 
+# Inferred unified depth = 15
+# Saved train.pt | var_site=(1753, 1103547, 15)
+# Parsing VCF: 100%|██████████| 1103547/1103547 [07:59<00:00, 2301.16it/s]
+# Saved val.pt   | var_site=(751, 1103547, 15)
