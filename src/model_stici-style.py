@@ -454,7 +454,7 @@ if __name__ == "__main__":
     optimizer.step()
 
     # 6. 打印信息
-    print("Input  shape :", x.shape)        # (B, N, 3)
+    print("Input  shape :", x.shape)        # (B, N, 3) + (B,B)
     print("Output shape :", outputs.shape)   # (B, N, 2)
     print("Loss :", loss.item())
 

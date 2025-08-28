@@ -1,102 +1,115 @@
-
+"""
+EvoFill – 加入遗传距离的 STICI 改进版
+依赖: flash-attn>=2.6
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attn import flash_attn_func
+
 from src.utils import load_config
 
-
-class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self, dim):
+# --------------------------------------------------
+# 基础组件
+# --------------------------------------------------
+class FlashMultiHeadAttention(nn.Module):
+    """
+    序列维度 Flash-Attention；对 (batch, seqlen, dim) 做自注意力
+    """
+    def __init__(self, embed_dim, num_heads, dropout=0.0):
         super().__init__()
-        self.dim = dim
+        assert embed_dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = dropout
 
     def forward(self, x):
-        # x: (B, n_heads, L, d)
-        B, n_heads, L, d = x.shape
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, d, 2, device=x.device).float() / d))
-        t = torch.arange(L, device=x.device).float()[:, None] * inv_freq[None, :]
-        cos = torch.cos(t)   # (L, d//2)
-        sin = torch.sin(t)
-
-        x1, x2 = x[..., 0::2], x[..., 1::2]
-        return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
-
-
-class DistanceToBias(nn.Module):
-    def __init__(self, n_heads):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(n_heads))
-
-    def forward(self, d):
-        # d: scalar or (B,)
-        d = torch.as_tensor(d).view(-1)  # (B,)
-        return d.unsqueeze(-1) * self.weight  # (B, n_heads)
-
-
-class MultiHeadSelfCrossAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout, block_size):
-        super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.scale = self.head_dim ** -0.5
-        self.block_size = block_size
-        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.out = nn.Linear(d_model, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.rope = RotaryPositionalEmbedding(self.head_dim)
-
-    @staticmethod
-    def block_causal_mask(n_blocks, block_size, device):
-        """
-        n_blocks : 短序列条数 (n_snp)
-        block_size: 每条长度 (k)
-        return    : (n_blocks*block_size, n_blocks*block_size) 的 bool 掩码
-        """
-        L = n_blocks * block_size
-        mask = torch.zeros(L, L, dtype=torch.bool, device=device)
-        for b in range(n_blocks):
-            start = b * block_size
-            end   = (b + 1) * block_size
-            mask[start:end, start:end] = torch.tril(
-                torch.ones(block_size, block_size, dtype=torch.bool, device=device)
-            )
-        return mask
-
-    def forward(self, x, context=None, dist_bias=None):
+        # x: (B, L, D)
         B, L, _ = x.shape
-        qkv = self.qkv(x).view(B, L, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)
-
-        if context is not None:
-            context = context.to(dtype=x.dtype, device=x.device)
-            kv = context.view(B, L, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-            k, v = kv[0], kv[1]
-
-        q, k = self.rope(q), self.rope(k)
-        att = (q @ k.transpose(-2, -1)) * self.scale
-        n_blocks = L // self.block_size          # 这里 block_size=k
-        mask = self.block_causal_mask(n_blocks, self.block_size, att.device)
-        att = att.masked_fill(~mask, torch.finfo(att.dtype).min)
-
-        if dist_bias is not None:
-            dist_bias = dist_bias.to(dtype=att.dtype)
-            att = att + dist_bias.view(-1, self.n_heads, 1, 1)
-
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-        v = v.to(dtype=att.dtype)
-        out = (att @ v).transpose(1, 2).contiguous().view(B, L, -1).to(dtype=self.out.weight.dtype)
-        return self.out(out)
+        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, L, Dh)
+        out = flash_attn_func(q, k, v, dropout_p=self.dropout, causal=False)
+        out = out.reshape(B, L, -1)
+        return self.proj(out)
 
 
-class FeedForward(nn.Module):
-    def __init__(self, d_model, d_ff, dropout):
+class SampleFlashAttention(nn.Module):
+    """
+    样本维度 Flash-Attention：在样本维度做注意力，遗传距离作为偏置。
+    使用手动实现的注意力来处理距离偏置。
+    """
+    def __init__(self, embed_dim, num_heads, dropout=0.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = dropout
+        self.dropout_layer = nn.Dropout(dropout)
+
+    def forward(self, x, dist_bias):
+        """
+        x: (N, L, D)          N = n_samples, L = seqlen
+        dist_bias: (N, N)    遗传距离矩阵，作为注意力偏置
+        """
+        N, L, D = x.shape
+        
+        # 确保 dist_bias 与 x 的数据类型一致
+        dist_bias = dist_bias.to(x.dtype)
+        
+        qkv = self.qkv(x).reshape(N, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)   # (3, N, H, L, Dh)
+        
+        # 确保 q, k, v 的数据类型一致
+        q = q.to(x.dtype)
+        k = k.to(x.dtype)
+        v = v.to(x.dtype)
+        
+        # 转置为 (N, H, L, Dh) -> (H, L, N, Dh) 以便在样本维度计算注意力
+        q = q.permute(1, 2, 0, 3)  # (H, L, N, Dh)
+        k = k.permute(1, 2, 0, 3)  # (H, L, N, Dh)
+        v = v.permute(1, 2, 0, 3)  # (H, L, N, Dh)
+        
+        # 计算注意力分数
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (H, L, N, N)
+        
+        # 添加距离偏置，扩展维度以匹配注意力分数
+        dist_bias = dist_bias.unsqueeze(0).unsqueeze(0)  # (1, 1, N, N)
+        dist_bias = dist_bias.expand(self.num_heads, L, -1, -1)  # (H, L, N, N)
+        
+        attn_scores = attn_scores + dist_bias
+        
+        # 计算注意力权重
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout_layer(attn_weights)
+        
+        # 确保注意力权重和 v 的数据类型一致
+        attn_weights = attn_weights.to(v.dtype)
+        
+        # 应用注意力权重
+        out = torch.matmul(attn_weights, v)  # (H, L, N, Dh)
+        
+        # 重新排列维度
+        out = out.permute(2, 0, 1, 3)  # (N, H, L, Dh)
+        out = out.reshape(N, L, -1)  # (N, L, H * Dh)
+        
+        return self.proj(out)
+
+
+class FFN(nn.Module):
+    def __init__(self, dim, ff_mult=4, dropout=0.0):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(d_model, d_ff),
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * ff_mult),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
+            nn.Linear(dim * ff_mult, dim),
             nn.Dropout(dropout)
         )
 
@@ -104,153 +117,107 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
-class EvoTLayer(nn.Module):
-    def __init__(self, d_model, n_heads, dropout,block_size):
+class FlashTransformerBlock(nn.Module):
+    """
+    序列自注意力 + 样本注意力 + FFN
+    """
+    def __init__(self, embed_dim, num_heads, dropout=0.0):
         super().__init__()
-        self.self1 = MultiHeadSelfCrossAttention(d_model, n_heads, dropout, block_size)
-        self.self2 = MultiHeadSelfCrossAttention(d_model, n_heads, dropout, block_size)
-        self.cross1 = MultiHeadSelfCrossAttention(d_model, n_heads, dropout, block_size)
-        self.cross2 = MultiHeadSelfCrossAttention(d_model, n_heads, dropout, block_size)
-        self.ff1 = FeedForward(d_model, 4 * d_model, dropout)
-        self.ff2 = FeedForward(d_model, 4 * d_model, dropout)
-        self.norm = nn.LayerNorm(d_model)
-        self.dist_bias = DistanceToBias(n_heads)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.seq_attn = FlashMultiHeadAttention(embed_dim, num_heads, dropout)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.sample_attn = SampleFlashAttention(embed_dim, num_heads, dropout)
+        self.norm3 = nn.LayerNorm(embed_dim)
+        self.ffn = FFN(embed_dim, dropout=dropout)
 
-    def forward(self, x1, x2, d):
-        bias = self.dist_bias(d)
-        x1 = self.norm(x1 + self.self1(x1, dist_bias=bias))
-        x2 = self.norm(x2 + self.self2(x2, dist_bias=bias))
-        cx1 = self.norm(x1 + self.cross1(x1, context=None, dist_bias=bias))
-        cx2 = self.norm(x2 + self.cross2(x2, context=None, dist_bias=bias))
-        cx1 = self.norm(cx1 + self.ff1(cx1))
-        cx2 = self.norm(cx2 + self.ff2(cx2))
-        return cx1, cx2
+    def forward(self, x, dist_mat):
+        """
+        x: (N, L, D)
+        dist_mat: (N, N)
+        """
+        # 确保 dist_mat 与 x 的数据类型一致
+        dist_mat = dist_mat.to(x.dtype)
+        
+        # 1) 序列维度自注意力
+        x = x + self.seq_attn(self.norm1(x))
+        # 2) 样本维度交叉注意力（遗传距离作为偏置）
+        x = x + self.sample_attn(self.norm2(x), dist_mat)
+        # 3) FFN
+        x = x + self.ffn(self.norm3(x))
+        return x
 
 
+# --------------------------------------------------
+# 主模型
+# --------------------------------------------------
 class EvoFill(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int, n_layer: int,
-                 n_heads: int, dropout: float, k: int):
+    def __init__(self,
+                 depth: int = 3,
+                 embed_dim: int = 64,
+                 num_heads: int = 8,
+                 n_layers: int = 4,
+                 dropout: float = 0.1):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-        self.k = k
-
-        self.embed = nn.Embedding(vocab_size, d_model)
-        self.layers = nn.ModuleList(
-            [EvoTLayer(d_model, n_heads, dropout, k) for _ in range(n_layer)]
+        self.depth = depth
+        self.embed = nn.Linear(depth, embed_dim, bias=False)
+        self.blocks = nn.ModuleList([
+            FlashTransformerBlock(embed_dim, num_heads, dropout) for _ in range(n_layers)
+        ])
+        self.out_proj = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, depth)  # 输出 depth 个类别
         )
-        self.norm = nn.LayerNorm(d_model)
-        self.head1 = nn.Linear(d_model, vocab_size, bias=False)
-        self.head2 = nn.Linear(d_model, vocab_size, bias=False)
-        self.head1.weight = self.embed.weight  # tie weight
 
-    def forward(self, seq1, seq2, mask1, mask2, pdis):
+    def forward(self, x: torch.Tensor, dist_mat: torch.Tensor):
         """
-        seq1/seq2 : (1, n_snp, k)  int64
-        mask1/2   : (1, n_snp, k)  float32  0/1 掩码
-        pdis      : scalar  浮点数
+        x: (N, L) 整型矩阵，数值范围 0-depth
+        dist_mat: (N, N) 遗传距离矩阵
+        return: (N, L, depth) 概率矩阵
         """
-        # 把 batch 维度保留为 1
-        ids1 = seq1.view(1, -1)   # (1, n_snp*k)
-        ids2 = seq2.view(1, -1)
-
-        x1 = self.embed(ids1)     # (1, L, d_model)
-        x2 = self.embed(ids2)
-
-        # pdis -> tensor
-        d = torch.tensor(pdis, device=ids1.device, dtype=x1.dtype)
-
-        for layer in self.layers:
-            x1, x2 = layer(x1, x2, d)
-
-        x1 = self.norm(x1)
-        x2 = self.norm(x2)
-
-        _, L, _ = x1.shape
-        n_snp, k = seq1.shape[1], seq1.shape[2]
-        logits1 = self.head1(x1).view(1, n_snp, k, self.vocab_size)
-        logits2 = self.head2(x2).view(1, n_snp, k, self.vocab_size)
-
-        return logits1, logits2
+        # 创建 one-hot 编码
+        if x.dtype != torch.long:
+            x = x.long()
+        x_one_hot = F.one_hot(x, num_classes=self.depth).float()
+        weight_dtype = next(self.parameters()).dtype
+        if x_one_hot.dtype != weight_dtype:
+            x_one_hot = x_one_hot.to(weight_dtype)     
+        x_emb = self.embed(x_one_hot)  # (N, L, embed_dim)
+        
+        # 通过所有 transformer block
+        for blk in self.blocks:
+            x_emb = blk(x_emb, dist_mat)
+        
+        # 输出投影到 depth 维度
+        logits = self.out_proj(x_emb)  # (N, L, depth)
+        return F.softmax(logits, dim=-1)
 
 
+# --------------------------------------------------
+# 本地测试
+# --------------------------------------------------
 if __name__ == "__main__":
-    cfg = load_config("config/config.json")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    import torch.cuda as cuda
+    from torch.amp import autocast
+    device = torch.device("cuda" if cuda.is_available() else "cpu")
 
-    model = EvoFill(
-        vocab_size=cfg.model.vocab_size,
-        d_model=cfg.model.d_model,
-        n_layer=cfg.model.n_layer,
-        n_heads=cfg.model.n_heads,
-        dropout=cfg.model.dropout,
-        k=cfg.data.k_mer 
-    ).to(device)
+    cfg = load_config('config/config.json')
+    depth = 15
 
-    # 随机单条样本对
-    n_var = cfg.model.n_var
-    k = cfg.data.k_mer
-    seq1 = torch.randint(0, cfg.model.vocab_size, (1, n_var, k), device=device)
-    seq2 = torch.randint(0, cfg.model.vocab_size, (1, n_var, k), device=device)
-    mask1 = torch.randint(0, 2, (1, n_var, k), device=device).float()
-    mask2 = torch.randint(0, 2, (1, n_var, k), device=device).float()
-    pdis = 0.042
+    model = EvoFill(depth=depth,
+                    embed_dim=cfg.model.embed_dim,
+                    num_heads=cfg.model.n_heads,
+                    n_layers=cfg.model.n_layers,
+                    dropout=cfg.model.dropout).to(device)
 
-    model.eval()
-    with torch.no_grad():
-        logits1, logits2 = model(seq1, seq2, mask1, mask2, pdis)
-        print("logits1 shape:", logits1.shape)  # (1, n_var, k, vocab_size)
-        print("logits2 shape:", logits2.shape)
+    B, L = cfg.train.batch_size, cfg.train.n_var
+    x = torch.randint(0, depth, (B, L), device=device)
+    dist = torch.rand(B, B, device=device)
 
-    if device.type == "cuda":
-        print(torch.cuda.memory_summary())
+    with autocast("cuda", enabled=True):
+        out = model(x, dist)
+        print("Input :", x.shape)      # (B, L)
+        print("Dist  :", dist.shape)   # (B, B)
+        print("Output:", out.shape)    # (B, L, depth)
 
-# logits1 shape: torch.Size([1, 500, 64, 5])
-# logits2 shape: torch.Size([1, 500, 64, 5])
-# |===========================================================================|
-# |                  PyTorch CUDA memory summary, device ID 0                 |
-# |---------------------------------------------------------------------------|
-# |            CUDA OOMs: 1            |        cudaMalloc retries: 1         |
-# |===========================================================================|
-# |        Metric         | Cur Usage  | Peak Usage | Tot Alloc  | Tot Freed  |
-# |---------------------------------------------------------------------------|
-# | Allocated memory      | 682537 KiB |  65430 MiB |   3115 GiB |   3114 GiB |
-# |       from large pool | 481280 KiB |  65235 MiB |   3114 GiB |   3114 GiB |
-# |       from small pool | 201257 KiB |    196 MiB |      0 GiB |      0 GiB |
-# |---------------------------------------------------------------------------|
-# | Active memory         | 682537 KiB |  65430 MiB |   3115 GiB |   3114 GiB |
-# |       from large pool | 481280 KiB |  65235 MiB |   3114 GiB |   3114 GiB |
-# |       from small pool | 201257 KiB |    196 MiB |      0 GiB |      0 GiB |
-# |---------------------------------------------------------------------------|
-# | Requested memory      | 682012 KiB |  65430 MiB |   3115 GiB |   3114 GiB |
-# |       from large pool | 480768 KiB |  65235 MiB |   3114 GiB |   3114 GiB |
-# |       from small pool | 201244 KiB |    196 MiB |      0 GiB |      0 GiB |
-# |---------------------------------------------------------------------------|
-# | GPU reserved memory   |  66984 MiB |  66984 MiB |  67132 MiB | 151552 KiB |
-# |       from large pool |  66786 MiB |  66786 MiB |  66934 MiB | 151552 KiB |
-# |       from small pool |    198 MiB |    198 MiB |    198 MiB |      0 KiB |
-# |---------------------------------------------------------------------------|
-# | Non-releasable memory |   7639 KiB |   2381 MiB | 112073 MiB | 112065 MiB |
-# |       from large pool |   6144 KiB |   2381 MiB | 111628 MiB | 111622 MiB |
-# |       from small pool |   1495 KiB |      2 MiB |    444 MiB |    442 MiB |
-# |---------------------------------------------------------------------------|
-# | Allocations           |     502    |     517    |   33598    |   33096    |
-# |       from large pool |       6    |      20    |    1544    |    1538    |
-# |       from small pool |     496    |     499    |   32054    |   31558    |
-# |---------------------------------------------------------------------------|
-# | Active allocs         |     502    |     517    |   33598    |   33096    |
-# |       from large pool |       6    |      20    |    1544    |    1538    |
-# |       from small pool |     496    |     499    |   32054    |   31558    |
-# |---------------------------------------------------------------------------|
-# | GPU reserved segments |     113    |     113    |     118    |       5    |
-# |       from large pool |      14    |      14    |      19    |       5    |
-# |       from small pool |      99    |      99    |      99    |       0    |
-# |---------------------------------------------------------------------------|
-# | Non-releasable allocs |       8    |      16    |   16648    |   16640    |
-# |       from large pool |       4    |      11    |     848    |     844    |
-# |       from small pool |       4    |       6    |   15800    |   15796    |
-# |---------------------------------------------------------------------------|
-# | Oversize allocations  |       0    |       0    |       0    |       0    |
-# |---------------------------------------------------------------------------|
-# | Oversize GPU segments |       0    |       0    |       0    |       0    |
-# |===========================================================================|
+    print(f"Peak GPU memory: {cuda.max_memory_allocated(device)/1024**2:.2f} MB")
+    print(f"Output is probability distribution: {torch.allclose(out.sum(dim=-1), torch.ones(B, L, device=device))}")
