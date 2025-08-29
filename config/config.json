@@ -14,13 +14,14 @@
     "dropout": 0.1
   },
   "train": {
+    "batch_size": 256,
     "dataloader_workers": 32,
     "n_var": 2000,
     "site_overlap": 100,
     "epochs": 100,
-    "mask_ratio": 0.2,
-    "train4test": 256,
-    "val_interval": 5,
+    "mask_ratio": 0.3,
+    "train4test": 500,
+    "val_interval": 10,
     "save_interval": 10,
     "save_dir": "./ckpt"
   }

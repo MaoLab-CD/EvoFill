@@ -70,6 +70,57 @@ class GeneticDataset(Dataset):
             'site_range': (start, end)
         }
 
+    def get_sample_indices(self):
+        """返回所有样本的索引"""
+        return torch.arange(self.n_samples)
+
+class GeneticSubset(Dataset):
+    """直接从筛选的样本构建新数据集"""
+    def __init__(self, original_dataset, sample_indices):
+        """
+        original_dataset: 原始 GeneticDataset
+        sample_indices: 要选择的样本索引列表
+        """
+        # 复制原始数据集的属性
+        self.n_var = original_dataset.n_var
+        self.site_overlap = original_dataset.site_overlap
+        self.is_train = original_dataset.is_train
+        self.site_groups = original_dataset.site_groups
+        self.total_sites = original_dataset.total_sites
+        
+        # 截取选中的样本数据
+        self.var_sites = original_dataset.var_sites[sample_indices].clone()
+        self.p_dis = original_dataset.p_dis[sample_indices][:, sample_indices].clone()
+        
+        # 更新样本数量和相关属性
+        self.n_samples = len(sample_indices)
+        self.total_items = self.n_samples * len(self.site_groups)
+        
+        # 保存样本映射关系（如果需要）
+        self.sample_mapping = sample_indices
+    
+    def __len__(self):
+        return self.total_items
+    
+    def __getitem__(self, idx):
+        sample_idx = idx // len(self.site_groups)
+        group_idx = idx % len(self.site_groups)
+        start, end = self.site_groups[group_idx]
+        
+        # 直接从当前数据集的 var_sites 获取数据
+        var_site = self.var_sites[sample_idx, start:end].clone()
+        
+        # 填充到固定长度
+        if var_site.shape[0] < self.n_var:
+            padding = torch.zeros(self.n_var - var_site.shape[0], dtype=torch.long)
+            var_site = torch.cat([var_site, padding])
+        
+        return {
+            'var_site': var_site,
+            'sample_idx': sample_idx,  # 这里使用在新数据集中的索引
+            'site_range': (start, end)
+        }
+
 # --------------------------------------------------
 # 数据加载器包装类
 # --------------------------------------------------
@@ -171,7 +222,7 @@ def masked_cross_entropy(predictions, targets, site_ranges):
 # --------------------------------------------------
 # 验证函数
 # --------------------------------------------------
-def validate_model(model, dataset, var_index, batch_size, device, mask_ratio=0.2, desc="Validation"):
+def validate_model(model, dataset, batch_size, device, mask_ratio=0.2, desc="Validation"):
     model.eval()
     total_accuracy = 0.0
     total_batches = 0
@@ -188,15 +239,19 @@ def validate_model(model, dataset, var_index, batch_size, device, mask_ratio=0.2
         for batch in tqdm(val_loader, desc=desc):
             var_sites = batch['var_sites'].to(device)
             dist_mat = batch['dist_mat'].to(device)
-            site_ranges = batch['site_ranges']
+            site_ranges = torch.tensor(
+                [[s, e] for s, e in batch['site_ranges']], 
+                dtype=torch.long, 
+                device=device
+            )
             
             batch_size, n_var = var_sites.shape
             mask = torch.rand(batch_size, n_var, device=device) < mask_ratio
             masked_input = var_sites.clone()
-            masked_input[mask] = model.depth
+            masked_input[mask] = model.depth          # last one = missing 
             
             predictions = model(masked_input, dist_mat)
-            accuracy = masked_accuracy(predictions, var_sites, var_index, site_ranges)
+            accuracy = masked_accuracy(predictions, var_sites, site_ranges)
             total_accuracy += accuracy
             total_batches += 1
     
@@ -222,6 +277,8 @@ def main():
     # 加载并更新 DeepSpeed 配置
     with open("config/ds_config.json", 'r') as f:
         ds_config = json.load(f)
+
+    cfg.train.batch_size = ds_config['train_micro_batch_size_per_gpu']
     
     # 加载数据
     var_index = torch.load('data/var_index.pt')
@@ -245,8 +302,8 @@ def main():
     )
     
     # 创建固定测试样本集
-    train4test_indices = torch.randperm(len(train_dataset))[:cfg.train.train4test]
-    train4test_dataset = torch.utils.data.Subset(train_dataset, train4test_indices)
+    train4test_sample_indices = torch.randperm(train_dataset.n_samples)[:cfg.train.train4test]
+    train4test_dataset = GeneticSubset(train_dataset, train4test_sample_indices)
     
     # 初始化模型
     model = EvoFill(
@@ -271,7 +328,7 @@ def main():
     # 使用包装的数据加载器
     train_loader = GeneticDataLoader(
         train_dataset,
-        batch_size=ds_config['train_micro_batch_size_per_gpu'],
+        batch_size=cfg.train.batch_size,
         shuffle=True,
         num_workers=cfg.train.dataloader_workers,
         pin_memory=True  # 确保启用
@@ -354,12 +411,12 @@ def main():
         # 验证（只在 rank0 进行）
         if (epoch + 1) % cfg.train.val_interval == 0 and ds_dist.get_rank() == 0:
             train_accuracy = validate_model(
-                model_engine, train4test_dataset, var_index, ds_config['train_micro_batch_size_per_gpu'], 
+                model_engine, train4test_dataset, cfg.train.batch_size, 
                 model_engine.device, cfg.train.mask_ratio, "Train Validation"
             )
             
             val_accuracy = validate_model(
-                model_engine, val_dataset, var_index, ds_config['train_micro_batch_size_per_gpu'],
+                model_engine, val_dataset, cfg.train.batch_size,
                 model_engine.device, cfg.train.mask_ratio, "Val Validation"
             )
             

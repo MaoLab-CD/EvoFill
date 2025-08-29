@@ -158,38 +158,53 @@ class EvoFill(nn.Module):
                  n_layers: int = 4,
                  dropout: float = 0.1):
         super().__init__()
-        self.depth = depth
-        self.embed = nn.Linear(depth, embed_dim, bias=False)
+        self.depth = depth  # 有效类别数（不包含 missing）
+        self.embed = nn.Linear(depth + 1, embed_dim, bias=False)  # 输入维度 depth+1（包含 missing）
         self.blocks = nn.ModuleList([
             FlashTransformerBlock(embed_dim, num_heads, dropout) for _ in range(n_layers)
         ])
         self.out_proj = nn.Sequential(
             nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, depth)  # 输出 depth 个类别
+            nn.Linear(embed_dim, depth)  # 输出 depth 个类别（不包含 missing）
         )
-
+        
     def forward(self, x: torch.Tensor, dist_mat: torch.Tensor):
         """
-        x: (N, L) 整型矩阵，数值范围 0-depth
+        x: (N, L) 整型矩阵，数值范围 0-depth (depth 代表 missing)
         dist_mat: (N, N) 遗传距离矩阵
-        return: (N, L, depth) 概率矩阵
+        return: (N, L, depth) 概率矩阵（不包含 missing）
         """
-        # 创建 one-hot 编码
+
+        # 创建 one-hot 编码（使用原始输入，包含 missing）
         if x.dtype != torch.long:
             x = x.long()
-        x_one_hot = F.one_hot(x, num_classes=self.depth).float()
+        x_one_hot = F.one_hot(x, num_classes=self.depth + 1).float()
+        
+        # 确保数据类型一致
         weight_dtype = next(self.parameters()).dtype
         if x_one_hot.dtype != weight_dtype:
-            x_one_hot = x_one_hot.to(weight_dtype)     
+            x_one_hot = x_one_hot.to(weight_dtype)
+        
+        # 嵌入层
         x_emb = self.embed(x_one_hot)  # (N, L, embed_dim)
         
         # 通过所有 transformer block
         for blk in self.blocks:
             x_emb = blk(x_emb, dist_mat)
         
-        # 输出投影到 depth 维度
+        # 输出投影到 depth 维度（不包含 missing）
         logits = self.out_proj(x_emb)  # (N, L, depth)
+        
+        # 对于 missing 位置，我们可以选择保持预测或者进行特殊处理
+        # 这里直接返回 softmax 结果
         return F.softmax(logits, dim=-1)
+
+    def predict(self, x: torch.Tensor, dist_mat: torch.Tensor):
+        """
+        预测方法：返回最可能的类别
+        """
+        probs = self.forward(x, dist_mat)
+        return torch.argmax(probs, dim=-1)
 
 
 # --------------------------------------------------
@@ -201,7 +216,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if cuda.is_available() else "cpu")
 
     cfg = load_config('config/config.json')
-    depth = 15
+    depth = 3  # 有效类别数
 
     model = EvoFill(depth=depth,
                     embed_dim=cfg.model.embed_dim,
@@ -210,14 +225,17 @@ if __name__ == "__main__":
                     dropout=cfg.model.dropout).to(device)
 
     B, L = cfg.train.batch_size, cfg.train.n_var
-    x = torch.randint(0, depth, (B, L), device=device)
+    # 输入范围：0-3 (3 代表 missing)
+    x = torch.randint(0, depth + 1, (B, L), device=device)
     dist = torch.rand(B, B, device=device)
 
     with autocast("cuda", enabled=True):
         out = model(x, dist)
         print("Input :", x.shape)      # (B, L)
+        print("Input range:", x.min().item(), "-", x.max().item())  # 0-3
         print("Dist  :", dist.shape)   # (B, B)
-        print("Output:", out.shape)    # (B, L, depth)
+        print("Output:", out.shape)    # (B, L, depth) - 不包含 missing
+        print("Output range:", out.min().item(), "-", out.max().item())  # 概率值
 
     print(f"Peak GPU memory: {cuda.max_memory_allocated(device)/1024**2:.2f} MB")
-    print(f"Output is probability distribution: {torch.allclose(out.sum(dim=-1), torch.ones(B, L, device=device))}")
+    print(f"Output is probability distribution: {torch.allclose(out.sum(dim=-1), torch.ones(B, L, device=device), atol=1e-6)}")
