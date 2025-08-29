@@ -171,7 +171,7 @@ def masked_cross_entropy(predictions, targets, site_ranges):
 # --------------------------------------------------
 # 验证函数
 # --------------------------------------------------
-def validate_model(model, dataset, var_index, cfg, device, mask_ratio=0.2, desc="Validation"):
+def validate_model(model, dataset, var_index, batch_size, device, mask_ratio=0.2, desc="Validation"):
     model.eval()
     total_accuracy = 0.0
     total_batches = 0
@@ -179,7 +179,7 @@ def validate_model(model, dataset, var_index, cfg, device, mask_ratio=0.2, desc=
     # 使用包装的数据加载器
     val_loader = GeneticDataLoader(
         dataset, 
-        batch_size=cfg.train.batch_size,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=2
     )
@@ -354,12 +354,12 @@ def main():
         # 验证（只在 rank0 进行）
         if (epoch + 1) % cfg.train.val_interval == 0 and ds_dist.get_rank() == 0:
             train_accuracy = validate_model(
-                model_engine, train4test_dataset, var_index, cfg, 
+                model_engine, train4test_dataset, var_index, ds_config['train_micro_batch_size_per_gpu'], 
                 model_engine.device, cfg.train.mask_ratio, "Train Validation"
             )
             
             val_accuracy = validate_model(
-                model_engine, val_dataset, var_index, cfg,
+                model_engine, val_dataset, var_index, ds_config['train_micro_batch_size_per_gpu'],
                 model_engine.device, cfg.train.mask_ratio, "Val Validation"
             )
             
