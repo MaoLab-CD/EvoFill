@@ -254,7 +254,8 @@ def validate_model(model, dataset, batch_size, device, mask_ratio=0.2, desc="Val
             accuracy = masked_accuracy(predictions, var_sites, site_ranges)
             total_accuracy += accuracy
             total_batches += 1
-    
+
+    ds_dist.barrier()  
     return total_accuracy / total_batches if total_batches > 0 else 0.0
 
 
@@ -267,6 +268,9 @@ def print_rank0(*args, **kwargs):
         print(*args, **kwargs)
 
 def main():
+    torch.manual_seed(42)          # CPU seed
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
     # 加载配置
     cfg = load_config("config/config.json")
     
@@ -302,7 +306,8 @@ def main():
     )
     
     # 创建固定测试样本集
-    train4test_sample_indices = torch.randperm(train_dataset.n_samples)[:cfg.train.train4test]
+    g = torch.Generator().manual_seed(2024)
+    train4test_sample_indices = torch.randperm(train_dataset.n_samples, generator=g)[:cfg.train.train4test]
     train4test_dataset = GeneticSubset(train_dataset, train4test_sample_indices)
     
     # 初始化模型
@@ -313,7 +318,7 @@ def main():
         n_layers=cfg.model.n_layers,
         dropout=cfg.model.dropout
     )
-    
+
     # 初始化 DeepSpeed
     model_engine, optimizer, _, _ = deepspeed.initialize(
         model=model,
@@ -333,6 +338,12 @@ def main():
         num_workers=cfg.train.dataloader_workers,
         pin_memory=True  # 确保启用
     )
+
+    # 初始化早停
+    if cfg.train.early_stop.patience <= 0:
+        cfg.train.early_stop.patience = float('inf')  # 永不早停
+    best_val_acc = -1.0
+    patience_counter = 0
     
     # 计算总批次数
     total_batches = len(train_loader)
@@ -408,19 +419,39 @@ def main():
         
         print_rank0(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
         
-        # 验证（只在 rank0 进行）
-        if (epoch + 1) % cfg.train.val_interval == 0 and ds_dist.get_rank() == 0:
+        # ---------------- 验证 & 早停 ----------------
+        if (epoch + 1) % cfg.train.val_interval == 0:
             train_accuracy = validate_model(
-                model_engine, train4test_dataset, cfg.train.batch_size, 
+                model_engine, train4test_dataset, cfg.train.batch_size,
                 model_engine.device, cfg.train.mask_ratio, "Train Validation"
             )
-            
+
             val_accuracy = validate_model(
                 model_engine, val_dataset, cfg.train.batch_size,
                 model_engine.device, cfg.train.mask_ratio, "Val Validation"
             )
-            
             print_rank0(f"Train Mask Accuracy: {train_accuracy:.4f}, Val Mask Accuracy: {val_accuracy:.4f}")
+
+            # ---------- rank0 判断是否早停 ----------
+            should_stop = torch.tensor(0, dtype=torch.long, device=model_engine.device)
+            if ds_dist.get_rank() == 0:
+                if val_accuracy > best_val_acc + cfg.train.early_stop.min_delta:
+                    best_val_acc = val_accuracy
+                    patience_counter = 0
+                    # 保存最佳权重
+                    model_engine.save_checkpoint(cfg.train.save_dir, tag="best_model", client_state={'best_val_acc': best_val_acc})
+                    print_rank0(f"New best val_acc={val_accuracy:.4f}, checkpoint saved.")
+                else:
+                    patience_counter += 1
+                    print_rank0(f"Val acc did not improve for {patience_counter}/{cfg.train.early_stop.patience} epochs")
+                    if patience_counter >= cfg.train.early_stop.patience:
+                        should_stop.fill_(1)
+
+            # 广播 should_stop
+            ds_dist.broadcast(should_stop, 0)
+            if should_stop.item():
+                print_rank0("Early stopping triggered. Exit training.")
+                break
         
         # 保存检查点
         if (epoch + 1) % cfg.train.save_interval == 0:

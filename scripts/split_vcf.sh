@@ -23,10 +23,6 @@ rm chunk_*
 bcftools view -S train.list -Oz -o "${prefix}_train.vcf.gz" "$in"
 bcftools view -S val.list  -Oz -o "${prefix}_val.vcf.gz"  "$in"
 
-# 4. 索引
-tabix -p vcf "${prefix}_train.vcf.gz"
-tabix -p vcf "${prefix}_val.vcf.gz"
-
 echo "Done. Output files:"
 echo "  ${prefix}_train.vcf.gz (${prefix}_train.vcf.gz.tbi)"
 echo "  ${prefix}_val.vcf.gz  (${prefix}_val.vcf.gz.tbi)"
