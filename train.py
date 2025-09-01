@@ -435,34 +435,38 @@ def main():
             print_rank0(f"Train Mask Accuracy: {train_accuracy:.4f}, Val Mask Accuracy: {val_accuracy:.4f}")
             
             # ====== 早停逻辑（仅在 rank0 进行） ======
-            stop_flag_tensor = torch.tensor(0, dtype=torch.long, device=model_engine.device)  # 0 表示继续，1 表示停止
+            save_best = torch.tensor(0, dtype=torch.long, device=model_engine.device)   # 1=需要保存
+            stop_flag = torch.tensor(0, dtype=torch.long, device=model_engine.device)   # 1=需要停止
             if ds_dist.get_rank() == 0:
                 if val_accuracy > best_val_acc + cfg.train.early_stop.min_delta:
                     best_val_acc = val_accuracy
                     patience_counter = 0
-                    need_save_best = True          # 标记要存 best
+                    save_best.fill_(1)                     # 通知所有 rank 保存 best
                 else:
                     patience_counter += 1
 
                 if patience_counter >= cfg.train.early_stop.patience:
                     print_rank0(f"Early stopping at epoch {epoch + 1}")
-                    stop_flag_tensor.fill_(1)
+                    stop_flag.fill_(1)
 
-            # 广播两件事：是否早停、是否存 best
-            ds_dist.broadcast(stop_flag_tensor, 0)
-            ds_dist.broadcast(torch.tensor([int(need_save_best)], device=model_engine.device), 0)
+            # 2. 广播决定
+            ds_dist.broadcast(save_best, 0)
+            ds_dist.broadcast(stop_flag, 0)
 
-            # 所有 rank 一起保存
-            if need_save_best:
+            # 3. 所有 rank 一起行动
+            if save_best.item():
+                # 这里每个 rank 都会执行 save_checkpoint，内部会同步
                 model_engine.save_checkpoint(cfg.train.save_dir, tag="best")
 
-            if stop_flag_tensor.item() == 1:
+            if stop_flag.item():
                 break
 
-        # ---------- 定期保存 ----------
-        elif (epoch + 1) % cfg.train.save_interval == 0:
-            # 同样要所有 rank 一起调用
-            model_engine.save_checkpoint(cfg.train.save_dir, tag=f"epoch_{epoch+1}")
+        # 保存检查点
+        if (epoch + 1) % cfg.train.save_interval == 0:
+            model_engine.save_checkpoint(
+                cfg.train.save_dir, 
+                tag=f"epoch_{epoch+1}"
+            )
     
     ds_dist.barrier()
     if ds_dist.get_rank() == 0:
