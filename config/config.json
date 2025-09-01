@@ -25,8 +25,8 @@
     "save_interval": 10,
     "save_dir": "./ckpt",
     "early_stop": {
-      "patience": 5,
-      "min_delta": 0.0
+      "patience": 2,
+      "min_delta": 0.001
     }
   }
 }

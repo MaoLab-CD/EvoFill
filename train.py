@@ -2,7 +2,7 @@
 '''
 deepspeed --num_gpus 2 train.py
 '''
-
+import os
 import torch
 import torch.nn.functional as F
 import deepspeed
@@ -232,11 +232,11 @@ def validate_model(model, dataset, batch_size, device, mask_ratio=0.2, desc="Val
         dataset, 
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2
+        num_workers=0
     )
     
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc=desc):
+        for batch in (tqdm(val_loader, desc=desc) if ds_dist.get_rank() == 0 else val_loader):
             var_sites = batch['var_sites'].to(device)
             dist_mat = batch['dist_mat'].to(device)
             site_ranges = torch.tensor(
@@ -327,9 +327,10 @@ def main():
     )
     var_index = var_index.to(model_engine.device) 
 
-    # print(f"Global batch size: {ds_config['train_batch_size']}")
-    # print(f"Per GPU batch size: {ds_config['train_micro_batch_size_per_gpu']}")
-    
+    if ds_dist.get_rank() == 0:
+        os.makedirs(cfg.train.save_dir, exist_ok=True)
+    ds_dist.barrier()          # 等 rank0 建完目录
+        
     # 使用包装的数据加载器
     train_loader = GeneticDataLoader(
         train_dataset,
@@ -342,7 +343,7 @@ def main():
     # 初始化早停
     if cfg.train.early_stop.patience <= 0:
         cfg.train.early_stop.patience = float('inf')  # 永不早停
-    best_val_acc = -1.0
+    best_val_acc = 0.0
     patience_counter = 0
     
     # 计算总批次数
@@ -430,35 +431,42 @@ def main():
                 model_engine, val_dataset, cfg.train.batch_size,
                 model_engine.device, cfg.train.mask_ratio, "Val Validation"
             )
-            print_rank0(f"Train Mask Accuracy: {train_accuracy:.4f}, Val Mask Accuracy: {val_accuracy:.4f}")
 
-            # ---------- rank0 判断是否早停 ----------
-            should_stop = torch.tensor(0, dtype=torch.long, device=model_engine.device)
+            print_rank0(f"Train Mask Accuracy: {train_accuracy:.4f}, Val Mask Accuracy: {val_accuracy:.4f}")
+            
+            # ====== 早停逻辑（仅在 rank0 进行） ======
+            stop_flag_tensor = torch.tensor(0, dtype=torch.long, device=model_engine.device)  # 0 表示继续，1 表示停止
             if ds_dist.get_rank() == 0:
-                if val_accuracy > best_val_acc + cfg.train.early_stop.min_delta:
+                improved = val_accuracy > best_val_acc + cfg.train.early_stop.min_delta
+                if improved:
                     best_val_acc = val_accuracy
                     patience_counter = 0
-                    # 保存最佳权重
-                    model_engine.save_checkpoint(cfg.train.save_dir, tag="best_model", client_state={'best_val_acc': best_val_acc})
-                    print_rank0(f"New best val_acc={val_accuracy:.4f}, checkpoint saved.")
                 else:
                     patience_counter += 1
-                    print_rank0(f"Val acc did not improve for {patience_counter}/{cfg.train.early_stop.patience} epochs")
-                    if patience_counter >= cfg.train.early_stop.patience:
-                        should_stop.fill_(1)
 
-            # 广播 should_stop
-            ds_dist.broadcast(should_stop, 0)
-            if should_stop.item():
-                print_rank0("Early stopping triggered. Exit training.")
+                if patience_counter >= cfg.train.early_stop.patience:
+                    print_rank0(f"Early stopping at epoch {epoch + 1}")
+                    stop_flag_tensor.fill_(1)
+
+            if improved:
+                model_engine.save_checkpoint(cfg.train.save_dir, tag="best")
+
+            # 广播 stop_flag 到所有 rank
+            ds_dist.broadcast(stop_flag_tensor, 0)
+            # 所有 rank 统一退出
+            if stop_flag_tensor.item() == 1:
                 break
-        
+
         # 保存检查点
         if (epoch + 1) % cfg.train.save_interval == 0:
             model_engine.save_checkpoint(
                 cfg.train.save_dir, 
                 tag=f"epoch_{epoch+1}"
             )
+    
+    ds_dist.barrier()
+    if ds_dist.get_rank() == 0:
+        print("Training finished.")
 
 if __name__ == "__main__":
     main()
