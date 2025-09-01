@@ -293,13 +293,13 @@ def main():
     
     # 创建数据集
     train_dataset = GeneticDataset(
-        'data/train.pt', 
+        'data/train_randomdis.pt', 
         cfg.train.n_var, 
         cfg.train.site_overlap, 
         is_train=True
     )
     val_dataset = GeneticDataset(
-        'data/val.pt', 
+        'data/val_randomdis.pt', 
         cfg.train.n_var, 
         site_overlap=0,
         is_train=False
@@ -350,127 +350,132 @@ def main():
     total_batches = len(train_loader)
     print_rank0(f"Total training batches per epoch: {total_batches}")
     
+    try:
     # 训练循环
-    for epoch in range(cfg.train.epochs):
-        model_engine.train()
-        epoch_loss = 0.0
-        epoch_accuracy = 0.0
-        processed_batches = 0
-        
-        # 只在 rank0 创建进度条
-        if ds_dist.get_rank() == 0:
-            progress_bar = tqdm(total=total_batches, desc=f"Epoch {epoch+1}/{cfg.train.epochs}")
-        else:
-            progress_bar = None
-        
-        for batch_idx, batch in enumerate(train_loader):
-            var_sites = batch['var_sites'].to(model_engine.device)
-            dist_mat = batch['dist_mat'].to(model_engine.device)
-            site_ranges = torch.tensor(
-                [[s, e] for s, e in batch['site_ranges']], 
-                dtype=torch.long, 
-                device=model_engine.device
-            )
+        for epoch in range(cfg.train.epochs):
+            model_engine.train()
+            epoch_loss = 0.0
+            epoch_accuracy = 0.0
+            processed_batches = 0
             
-            # 确保数据类型正确
-            if var_sites.dtype != torch.long:
-                var_sites = var_sites.long()
+            # 只在 rank0 创建进度条
+            if ds_dist.get_rank() == 0:
+                progress_bar = tqdm(total=total_batches, desc=f"Epoch {epoch+1}/{cfg.train.epochs}")
+            else:
+                progress_bar = None
             
-            weight_dtype = next(model_engine.parameters()).dtype
-            if dist_mat.dtype != weight_dtype:
-                dist_mat = dist_mat.to(weight_dtype)
-            
-            mask = _make_valid_mask(site_ranges, var_sites.size(1), var_sites.device)
-            if mask.sum() == 0:           # 本 batch 无有效位点
+            for batch_idx, batch in enumerate(train_loader):
+                var_sites = batch['var_sites'].to(model_engine.device)
+                dist_mat = batch['dist_mat'].to(model_engine.device)
+                site_ranges = torch.tensor(
+                    [[s, e] for s, e in batch['site_ranges']], 
+                    dtype=torch.long, 
+                    device=model_engine.device
+                )
+                
+                # 确保数据类型正确
+                if var_sites.dtype != torch.long:
+                    var_sites = var_sites.long()
+                
+                weight_dtype = next(model_engine.parameters()).dtype
+                if dist_mat.dtype != weight_dtype:
+                    dist_mat = dist_mat.to(weight_dtype)
+                
+                mask = _make_valid_mask(site_ranges, var_sites.size(1), var_sites.device)
+                if mask.sum() == 0:           # 本 batch 无有效位点
+                    if ds_dist.get_rank() == 0:
+                        progress_bar.update(1)
+                    continue                  # 直接跳过本轮
+                # 前向传播
+                predictions = model_engine(var_sites, dist_mat)
+                
+                # 计算损失
+                loss = masked_cross_entropy(predictions, var_sites, site_ranges)
+
+                # 反向传播
+                model_engine.backward(loss)
+                model_engine.step()
+                
+                # 计算准确度
+                accuracy = masked_accuracy(predictions, var_sites, site_ranges)
+                
+                epoch_loss += loss.item()
+                epoch_accuracy += accuracy
+                processed_batches += 1
+                
+                # 只在 rank0 更新进度条
                 if ds_dist.get_rank() == 0:
+                    progress_bar.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'acc': f'{accuracy:.4f}'
+                    })
                     progress_bar.update(1)
-                continue                  # 直接跳过本轮
-            # 前向传播
-            predictions = model_engine(var_sites, dist_mat)
             
-            # 计算损失
-            loss = masked_cross_entropy(predictions, var_sites, site_ranges)
-
-            # 反向传播
-            model_engine.backward(loss)
-            model_engine.step()
-            
-            # 计算准确度
-            accuracy = masked_accuracy(predictions, var_sites, site_ranges)
-            
-            epoch_loss += loss.item()
-            epoch_accuracy += accuracy
-            processed_batches += 1
-            
-            # 只在 rank0 更新进度条
+            # 关闭进度条
             if ds_dist.get_rank() == 0:
-                progress_bar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'acc': f'{accuracy:.4f}'
-                })
-                progress_bar.update(1)
+                progress_bar.close()
+            
+            # 计算epoch统计
+            avg_loss = epoch_loss / processed_batches
+            avg_accuracy = epoch_accuracy / processed_batches
+            
+            print_rank0(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
+            
+            # ---------------- 验证 & 早停 ----------------
+            if (epoch + 1) % cfg.train.val_interval == 0:
+                train_accuracy = validate_model(
+                    model_engine, train4test_dataset, cfg.train.batch_size,
+                    model_engine.device, cfg.train.mask_ratio, "Train Validation"
+                )
+
+                val_accuracy = validate_model(
+                    model_engine, val_dataset, cfg.train.batch_size,
+                    model_engine.device, cfg.train.mask_ratio, "Val Validation"
+                )
+
+                print_rank0(f"Train Mask Accuracy: {train_accuracy:.4f}, Val Mask Accuracy: {val_accuracy:.4f}")
+                
+                # ====== 早停逻辑（仅在 rank0 进行） ======
+                save_best = torch.tensor(0, dtype=torch.long, device=model_engine.device)   # 1=需要保存
+                stop_flag = torch.tensor(0, dtype=torch.long, device=model_engine.device)   # 1=需要停止
+                if ds_dist.get_rank() == 0:
+                    if val_accuracy > best_val_acc + cfg.train.early_stop.min_delta:
+                        best_val_acc = val_accuracy
+                        patience_counter = 0
+                        save_best.fill_(1)                     # 通知所有 rank 保存 best
+                    else:
+                        patience_counter += 1
+
+                    if patience_counter >= cfg.train.early_stop.patience:
+                        print_rank0(f"Early stopping at epoch {epoch + 1}")
+                        stop_flag.fill_(1)
+
+                # 2. 广播决定
+                ds_dist.broadcast(save_best, 0)
+                ds_dist.broadcast(stop_flag, 0)
+
+                # 3. 所有 rank 一起行动
+                if save_best.item():
+                    # 这里每个 rank 都会执行 save_checkpoint，内部会同步
+                    model_engine.save_checkpoint(cfg.train.save_dir, tag="best")
+
+                if stop_flag.item():
+                    break
+
+            # 保存检查点
+            if (epoch + 1) % cfg.train.save_interval == 0:
+                model_engine.save_checkpoint(
+                    cfg.train.save_dir, 
+                    tag=f"epoch_{epoch+1}"
+                )
         
-        # 关闭进度条
+    finally:
+        ds_dist.barrier()
         if ds_dist.get_rank() == 0:
-            progress_bar.close()
-        
-        # 计算epoch统计
-        avg_loss = epoch_loss / processed_batches
-        avg_accuracy = epoch_accuracy / processed_batches
-        
-        print_rank0(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
-        
-        # ---------------- 验证 & 早停 ----------------
-        if (epoch + 1) % cfg.train.val_interval == 0:
-            train_accuracy = validate_model(
-                model_engine, train4test_dataset, cfg.train.batch_size,
-                model_engine.device, cfg.train.mask_ratio, "Train Validation"
-            )
-
-            val_accuracy = validate_model(
-                model_engine, val_dataset, cfg.train.batch_size,
-                model_engine.device, cfg.train.mask_ratio, "Val Validation"
-            )
-
-            print_rank0(f"Train Mask Accuracy: {train_accuracy:.4f}, Val Mask Accuracy: {val_accuracy:.4f}")
-            
-            # ====== 早停逻辑（仅在 rank0 进行） ======
-            save_best = torch.tensor(0, dtype=torch.long, device=model_engine.device)   # 1=需要保存
-            stop_flag = torch.tensor(0, dtype=torch.long, device=model_engine.device)   # 1=需要停止
-            if ds_dist.get_rank() == 0:
-                if val_accuracy > best_val_acc + cfg.train.early_stop.min_delta:
-                    best_val_acc = val_accuracy
-                    patience_counter = 0
-                    save_best.fill_(1)                     # 通知所有 rank 保存 best
-                else:
-                    patience_counter += 1
-
-                if patience_counter >= cfg.train.early_stop.patience:
-                    print_rank0(f"Early stopping at epoch {epoch + 1}")
-                    stop_flag.fill_(1)
-
-            # 2. 广播决定
-            ds_dist.broadcast(save_best, 0)
-            ds_dist.broadcast(stop_flag, 0)
-
-            # 3. 所有 rank 一起行动
-            if save_best.item():
-                # 这里每个 rank 都会执行 save_checkpoint，内部会同步
-                model_engine.save_checkpoint(cfg.train.save_dir, tag="best")
-
-            if stop_flag.item():
-                break
-
-        # 保存检查点
-        if (epoch + 1) % cfg.train.save_interval == 0:
-            model_engine.save_checkpoint(
-                cfg.train.save_dir, 
-                tag=f"epoch_{epoch+1}"
-            )
-    
-    ds_dist.barrier()
-    if ds_dist.get_rank() == 0:
-        print("Training finished.")
+            print("Training finished.")
+        # 在退出前显式销毁进程组
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
     main()

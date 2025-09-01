@@ -65,6 +65,23 @@ def read_dismat(path: str, sample_order):
     dis.index = dis.columns = [s.strip() for s in dis.index]
     return dis.loc[sample_order, sample_order].values
 
+def random_dismat(path: str, sample_order):
+    dis = pd.read_csv(path, sep='\t', skiprows=[0], header=None, index_col=0)
+    dis.index = dis.columns = [s.strip() for s in dis.index]
+
+    # 2. 生成随机、对角对称矩阵
+    n = len(dis)                         # 维度
+    rng = np.random.default_rng(42)      # 固定种子，结果可复现
+    rand_vals = rng.random((n, n))
+
+    sym = np.triu(rand_vals) + np.triu(rand_vals, k=1).T
+    np.fill_diagonal(sym, 0)   # 对角线0
+
+    random_dis = pd.DataFrame(sym,
+                        index=dis.index,
+                        columns=dis.columns)
+
+    return random_dis.values
 
 # --------------------------- 编码 --------------------------- #
 def encode_tensor(gts: np.ndarray, depth: int):
@@ -81,6 +98,7 @@ if __name__ == "__main__":
     os.makedirs(cfg.data.out_dir, exist_ok=True)
 
     phased = bool(cfg.data.tihp)
+    random_dis = bool(cfg.data.random_dis)
 
      # 1) 训练集一次性读取 + 计算 depth
     train_gts, train_samples,var_index, depth = read_vcf(cfg.data.train_vcf, phased, cfg.data.out_dir)
@@ -88,18 +106,29 @@ if __name__ == "__main__":
     print(f"Inferred unified depth = {depth}")
 
     # 2) 处理训练集
-    dis_train = read_dismat(cfg.data.train_dismat, train_samples)
     var_train = encode_tensor(train_gts, depth)
-    torch.save({'var_site': var_train, 'p_dis': torch.from_numpy(dis_train)},
-               os.path.join(cfg.data.out_dir, "train.pt"))
+    if not random_dis:
+        dis_train = read_dismat(cfg.data.train_dismat, train_samples)
+        torch.save({'var_site': var_train, 'p_dis': torch.from_numpy(dis_train)},
+                os.path.join(cfg.data.out_dir, "train.pt"))
+    else:
+        dis_train = random_dismat(cfg.data.train_dismat, train_samples)
+        torch.save({'var_site': var_train, 'p_dis': torch.from_numpy(dis_train)},
+                os.path.join(cfg.data.out_dir, "train_randomdis.pt"))
     print(f"Saved train.pt | shape={tuple(var_train.shape)}+{tuple(dis_train.shape)}")
 
     # 3) 处理验证集（用同一 depth）
     val_gts, val_samples, _, _ = read_vcf(cfg.data.val_vcf, phased, cfg.data.out_dir)
-    dis_val = read_dismat(cfg.data.val_dismat, val_samples)
     var_val = encode_tensor(val_gts, depth)
-    torch.save({'var_site': var_val, 'p_dis': torch.from_numpy(dis_val)},
-               os.path.join(cfg.data.out_dir, "val.pt"))
+
+    if not random_dis:
+        dis_val = read_dismat(cfg.data.val_dismat, val_samples)
+        torch.save({'var_site': var_val, 'p_dis': torch.from_numpy(dis_val)},
+                os.path.join(cfg.data.out_dir, "val.pt"))
+    else:
+        dis_val = random_dismat(cfg.data.val_dismat, val_samples)
+        torch.save({'var_site': var_val, 'p_dis': torch.from_numpy(dis_val)},
+                os.path.join(cfg.data.out_dir, "val_randomdis.pt"))
     print(f"Saved val.pt   | shape={tuple(var_val.shape)}+{tuple(dis_val.shape)}")
 
 # Parsing VCF: 100%|██████████| 1103547/1103547 [18:24<00:00, 999.16it/s] 
