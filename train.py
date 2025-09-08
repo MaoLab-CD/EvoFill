@@ -291,7 +291,7 @@ def validate_model(model, dataset, batch_size, device, mask_ratio=0.2, desc="Val
     )
     
     with torch.no_grad():
-        for batch in (tqdm(val_loader, desc=desc) if ds_dist.get_rank() == 0 else val_loader):
+        for batch in (tqdm(val_loader, desc=desc, bar_format='{l_bar}{bar:20}{r_bar}') if ds_dist.get_rank() == 0 else val_loader):
             var_sites = batch['var_sites'].to(device)
             dist_mat = batch['dist_mat'].to(device) if batch['dist_mat'] is not None else None
             site_ranges = torch.tensor(
@@ -428,7 +428,7 @@ def main():
             
             # 只在 rank0 创建进度条
             if ds_dist.get_rank() == 0:
-                progress_bar = tqdm(total=total_batches, desc=f"Epoch {epoch+1}/{cfg.train.epochs}")
+                progress_bar = tqdm(total=total_batches, desc=f"Epoch {epoch+1}/{cfg.train.epochs}",bar_format='{l_bar}{bar:20}{r_bar}')
             else:
                 progress_bar = None
             
