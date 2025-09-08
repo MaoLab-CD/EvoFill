@@ -18,8 +18,6 @@ def classical_mds_eigs(D):
     explained = eigvals / eigvals.sum() * 100
     return eigvals, np.cumsum(explained)
 
-import numpy as np
-import matplotlib.pyplot as plt
 
 def scree_plot(eigvals, cum_explained, auto_k=True):
     """

@@ -216,9 +216,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if cuda.is_available() else "cpu")
 
     cfg = load_config('config/config.json')
-    depth = 3  # 有效类别数
+    depth = 15  # 有效类别数
 
-    model = EvoFill(depth=depth,
+    model = EvoFill(depth=depth, 
                     embed_dim=cfg.model.embed_dim,
                     num_heads=cfg.model.n_heads,
                     n_layers=cfg.model.n_layers,

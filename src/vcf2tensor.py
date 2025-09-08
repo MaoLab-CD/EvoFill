@@ -60,10 +60,37 @@ def read_vcf(path: str, phased: bool, out_dir: str):
     return gts, samples, var_index, depth
 
 # --------------------------- 读取距离矩阵 --------------------------- #
+def mds_projection(D, k):
+    """
+    给定距离矩阵 D 和目标维数 k，返回 n×k 的投影坐标矩阵 X
+    """
+    n = D.shape[0]
+    H = np.eye(n) - np.ones((n, n)) / n
+    B = -0.5 * H @ (D ** 2) @ H
+
+    eigvals, eigvecs = np.linalg.eigh(B)
+    idx_pos = eigvals > 1e-12
+    eigvals, eigvecs = eigvals[idx_pos][::-1], eigvecs[:, idx_pos][:, ::-1]
+
+    if k > len(eigvals):
+        raise ValueError(f"仅找到 {len(eigvals)} 个正特征值，无法投影到 {k} 维")
+
+    Lambda_k = np.diag(np.sqrt(eigvals[:k]))
+    V_k = eigvecs[:, :k]
+    X = V_k @ Lambda_k          # n×k
+    return X
+
 def read_dismat(path: str, sample_order):
     dis = pd.read_csv(path, sep='\t', skiprows=[0], header=None, index_col=0)
     dis.index = dis.columns = [s.strip() for s in dis.index]
     return dis.loc[sample_order, sample_order].values
+
+def dismat2coord(path: str, sample_order, k):
+    dis = pd.read_csv(path, sep='\t', skiprows=[0], header=None, index_col=0)
+    dis.index = dis.columns = [s.strip() for s in dis.index]
+    D = dis.loc[sample_order, sample_order].values
+    X_k = mds_projection(D, k)
+    return X_k
 
 def random_dismat(path: str, sample_order):
     dis = pd.read_csv(path, sep='\t', skiprows=[0], header=None, index_col=0)
@@ -98,9 +125,9 @@ if __name__ == "__main__":
     os.makedirs(cfg.data.out_dir, exist_ok=True)
 
     phased = bool(cfg.data.tihp)
-    random_dis = bool(cfg.data.random_dis)
+    random_dis = False #bool(cfg.data.random_dis)
 
-     # 1) 训练集一次性读取 + 计算 depth
+    # 1) 训练集一次性读取 + 计算 depth
     train_gts, train_samples,var_index, depth = read_vcf(cfg.data.train_vcf, phased, cfg.data.out_dir)
     torch.save(var_index, os.path.join(cfg.data.out_dir, "var_index.pt"))
     print(f"Inferred unified depth = {depth}")
@@ -108,7 +135,9 @@ if __name__ == "__main__":
     # 2) 处理训练集
     var_train = encode_tensor(train_gts, depth)
     if not random_dis:
-        dis_train = read_dismat(cfg.data.train_dismat, train_samples)
+        # dis_train = read_dismat(cfg.data.train_dismat, train_samples)
+        dis_train = dismat2coord(cfg.data.train_dismat, train_samples, k=5)
+        print(dis_train.shape)
         torch.save({'var_site': var_train, 'p_dis': torch.from_numpy(dis_train)},
                 os.path.join(cfg.data.out_dir, "train.pt"))
     else:
@@ -122,7 +151,8 @@ if __name__ == "__main__":
     var_val = encode_tensor(val_gts, depth)
 
     if not random_dis:
-        dis_val = read_dismat(cfg.data.val_dismat, val_samples)
+        # dis_val = read_dismat(cfg.data.val_dismat, val_samples)
+        dis_val = dismat2coord(cfg.data.val_dismat, val_samples, k=5)
         torch.save({'var_site': var_val, 'p_dis': torch.from_numpy(dis_val)},
                 os.path.join(cfg.data.out_dir, "val.pt"))
     else:
