@@ -52,7 +52,7 @@ class SampleFlashAttention(nn.Module):
         self.dropout = dropout
         self.dropout_layer = nn.Dropout(dropout)
 
-    def forward(self, x, dist_bias):
+    def forward(self, x,  dist_bias: torch.Tensor | None):
         """
         x: (N, L, D)          N = n_samples, L = seqlen
         dist_bias: (N, N)    遗传距离矩阵，作为注意力偏置
@@ -60,7 +60,7 @@ class SampleFlashAttention(nn.Module):
         N, L, D = x.shape
         
         # 确保 dist_bias 与 x 的数据类型一致
-        dist_bias = dist_bias.to(x.dtype)
+        dist_bias = dist_bias.to(x.dtype) if dist_bias is not None else None
         
         qkv = self.qkv(x).reshape(N, L, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)   # (3, N, H, L, Dh)
@@ -78,11 +78,11 @@ class SampleFlashAttention(nn.Module):
         # 计算注意力分数
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (H, L, N, N)
         
-        # 添加距离偏置，扩展维度以匹配注意力分数
-        dist_bias = dist_bias.unsqueeze(0).unsqueeze(0)  # (1, 1, N, N)
-        dist_bias = dist_bias.expand(self.num_heads, L, -1, -1)  # (H, L, N, N)
-        
-        attn_scores = attn_scores + dist_bias
+        if dist_bias is not None:                       # 只有传了才加偏置
+            dist_bias = dist_bias.to(x.dtype)
+            dist_bias = dist_bias.unsqueeze(0).unsqueeze(0)
+            dist_bias = dist_bias.expand(self.num_heads, L, -1, -1)
+            attn_scores = attn_scores + dist_bias
         
         # 计算注意力权重
         attn_weights = F.softmax(attn_scores, dim=-1)
@@ -130,13 +130,13 @@ class FlashTransformerBlock(nn.Module):
         self.norm3 = nn.LayerNorm(embed_dim)
         self.ffn = FFN(embed_dim, dropout=dropout)
 
-    def forward(self, x, dist_mat):
+    def forward(self, x, dist_mat: torch.Tensor | None = None):
         """
         x: (N, L, D)
         dist_mat: (N, N)
         """
         # 确保 dist_mat 与 x 的数据类型一致
-        dist_mat = dist_mat.to(x.dtype)
+        dist_mat = dist_mat.to(x.dtype) if dist_mat is not None else None
         
         # 1) 序列维度自注意力
         x = x + self.seq_attn(self.norm1(x))
@@ -168,7 +168,7 @@ class EvoFill(nn.Module):
             nn.Linear(embed_dim, depth)  # 输出 depth 个类别（不包含 missing）
         )
         
-    def forward(self, x: torch.Tensor, dist_mat: torch.Tensor):
+    def forward(self, x: torch.Tensor, dist_mat: torch.Tensor | None = None):
         """
         x: (N, L) 整型矩阵，数值范围 0-depth (depth 代表 missing)
         dist_mat: (N, N) 遗传距离矩阵
@@ -199,7 +199,7 @@ class EvoFill(nn.Module):
         # 这里直接返回 softmax 结果
         return F.softmax(logits, dim=-1)
 
-    def predict(self, x: torch.Tensor, dist_mat: torch.Tensor):
+    def predict(self, x: torch.Tensor, dist_mat: torch.Tensor | None = None):
         """
         预测方法：返回最可能的类别
         """

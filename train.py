@@ -3,6 +3,11 @@
 deepspeed --num_gpus 2 train.py
 '''
 import os
+import csv
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 import deepspeed
@@ -11,28 +16,37 @@ from torch.utils.data import Dataset, DataLoader
 from deepspeed import comm as ds_dist
 
 from src.model import EvoFill
-from src.utils import load_config
+from src.utils import load_config, export_config
 from tqdm import tqdm
 
 # --------------------------------------------------
 # 数据集类
 # --------------------------------------------------
 class GeneticDataset(Dataset):
-    def __init__(self, data_path, n_var, site_overlap=0, is_train=True):
-        """
-        优化内存使用的数据集类
-        """
+    def __init__(self,  data_path, n_var, site_overlap=0, is_train=True, cfg=None):
+
         # 使用内存映射方式加载数据
         self.data = torch.load(data_path, map_location='cpu')
-        self.var_sites = self.data['var_site']  # (samples, var_sites)
-        self.p_dis = self.data['p_dis']  # (samples, samples)
-        
-        self.n_samples = self.var_sites.shape[0]
-        self.total_sites = self.var_sites.shape[1]
-        self.n_var = n_var
-        self.site_overlap = site_overlap
-        self.is_train = is_train
-        
+        self.var_sites = self.data['var_site']          # (samples, var_sites)
+        self.n_samples, self.total_sites = self.var_sites.shape
+        self.n_var, self.site_overlap, self.is_train = n_var, site_overlap, is_train
+
+        if bool(cfg.train.use_fst):
+            fst_df       = pd.read_csv(cfg.data.fst_mat, index_col=0)
+            pop2idx      = {p:i for i,p in enumerate(fst_df.index)}
+            fst_np       = fst_df.values.astype(np.float32)   # (P,P)
+
+            # 样本 → 群体
+            sample_ids = self.data['sample_id']           # list of str
+            pop_ids    = [s.split('_')[0] for s in sample_ids]
+            pop_idx    = [pop2idx[p] for p in pop_ids]    # (N,)
+            # 查表得样本间距离
+            self.p_dis = torch.from_numpy(
+                fst_np[np.ix_(pop_idx, pop_idx)]          # (N,N)
+            )
+        else:
+            self.p_dis = None
+
         # 预计算所有位点组
         self.site_groups = self._precompute_site_groups()
         self.total_items = self.n_samples * len(self.site_groups)
@@ -74,29 +88,24 @@ class GeneticDataset(Dataset):
         """返回所有样本的索引"""
         return torch.arange(self.n_samples)
 
+
 class GeneticSubset(Dataset):
-    """直接从筛选的样本构建新数据集"""
     def __init__(self, original_dataset, sample_indices):
-        """
-        original_dataset: 原始 GeneticDataset
-        sample_indices: 要选择的样本索引列表
-        """
-        # 复制原始数据集的属性
-        self.n_var = original_dataset.n_var
+        self.n_var   = original_dataset.n_var
         self.site_overlap = original_dataset.site_overlap
         self.is_train = original_dataset.is_train
-        self.site_groups = original_dataset.site_groups
-        self.total_sites = original_dataset.total_sites
-        
-        # 截取选中的样本数据
+        self.site_groups  = original_dataset.site_groups
+        self.total_sites  = original_dataset.total_sites
+
+        # 截取
         self.var_sites = original_dataset.var_sites[sample_indices].clone()
-        self.p_dis = original_dataset.p_dis[sample_indices][:, sample_indices].clone()
-        
-        # 更新样本数量和相关属性
+        if original_dataset.p_dis is not None:
+            self.p_dis = original_dataset.p_dis[sample_indices][:, sample_indices].clone()
+        else:
+            self.p_dis = None
+
         self.n_samples = len(sample_indices)
         self.total_items = self.n_samples * len(self.site_groups)
-        
-        # 保存样本映射关系（如果需要）
         self.sample_mapping = sample_indices
     
     def __len__(self):
@@ -151,24 +160,21 @@ class GeneticDataLoader:
         return len(self.dataloader)
     
     def collate_fn(self, batch):
-        var_sites = torch.stack([item['var_site'] for item in batch])
-        # 确保 var_sites 是 long 类型
-        var_sites = var_sites.long()
-        
+        var_sites = torch.stack([item['var_site'] for item in batch]).long()
         sample_indices = torch.tensor([item['sample_idx'] for item in batch])
         site_ranges = [item['site_range'] for item in batch]
-        
-        # 直接使用数据集的距离矩阵
-        dist_mat = self.dataset.p_dis[sample_indices[:, None], sample_indices[None, :]]
-        dist_mat = dist_mat.float()
-        
+
+        if self.dataset.p_dis is not None:
+            dist_mat = self.dataset.p_dis[sample_indices[:, None], sample_indices[None, :]].float()
+        else:
+            dist_mat = None          # 模型已支持
+
         return {
             'var_sites': var_sites,
-            'dist_mat': dist_mat,
+            'dist_mat':  dist_mat,
             'sample_indices': sample_indices,
             'site_ranges': site_ranges
         }
-
 
 # --------------------------------------------------
 # 准确度计算函数
@@ -218,6 +224,55 @@ def masked_cross_entropy(predictions, targets, site_ranges):
     loss = F.cross_entropy(logits_valid, tgt_valid, reduction='sum')
     return loss / mask.sum().clamp(min=1)
 
+def masked_imputation_loss(predictions, targets, site_ranges, use_r2=True, group_size=4):
+    """
+    predictions: (B, L, D) logits
+    targets:     (B, L) int64
+    site_ranges: (B, 2) int64
+    """
+    B, L, D = predictions.shape
+    device = predictions.device
+    mask = _make_valid_mask(site_ranges, L, device)  # (B, L)
+
+    logits_valid = predictions[mask]  # (N_valid, D)
+    tgt_valid    = targets[mask]      # (N_valid,)
+
+    # 1. CE loss
+    ce_loss = F.cross_entropy(logits_valid, tgt_valid, reduction='sum')
+
+    # 2. KL loss
+    log_probs = F.log_softmax(logits_valid, dim=-1)
+    probs = F.softmax(logits_valid, dim=-1)
+    tgt_onehot = F.one_hot(tgt_valid, num_classes=D).float()
+    kl_loss = F.kl_div(log_probs, tgt_onehot, reduction='sum')
+
+    total_loss = ce_loss + kl_loss
+
+    # 3. Optional R² loss (Minimac-style)
+    if use_r2:
+        # 只支持 biallelic (D == 2)
+        assert D == 2, "R² loss only supports biallelic variants"
+        with torch.no_grad():
+            # 分组计算 alt allele frequency
+            n_full = len(tgt_valid) // group_size * group_size
+            tgt_grouped = tgt_valid[:n_full].view(-1, group_size)  # (G, group_size)
+            pred_probs = torch.softmax(logits_valid[:n_full], dim=-1)[:, 1]  # alt allele prob
+            pred_grouped = pred_probs.view(-1, group_size)
+
+            # 真实频率
+            gt_af = tgt_grouped.float().mean(dim=1)  # (G,)
+            # 预测频率
+            pred_af = pred_grouped.mean(dim=1)
+
+            # R² 损失
+            denom = gt_af * (1 - gt_af)
+            denom = torch.clamp(denom, min=0.01)
+            r2_error = torch.square(pred_af - gt_af) / denom
+            r2_loss = -r2_error.sum() * group_size  # 负号是因为我们要最小化负R²
+
+        total_loss += r2_loss
+
+    return total_loss / mask.sum().clamp(min=1)
 
 # --------------------------------------------------
 # 验证函数
@@ -238,7 +293,7 @@ def validate_model(model, dataset, batch_size, device, mask_ratio=0.2, desc="Val
     with torch.no_grad():
         for batch in (tqdm(val_loader, desc=desc) if ds_dist.get_rank() == 0 else val_loader):
             var_sites = batch['var_sites'].to(device)
-            dist_mat = batch['dist_mat'].to(device)
+            dist_mat = batch['dist_mat'].to(device) if batch['dist_mat'] is not None else None
             site_ranges = torch.tensor(
                 [[s, e] for s, e in batch['site_ranges']], 
                 dtype=torch.long, 
@@ -285,7 +340,7 @@ def main():
     cfg.train.batch_size = ds_config['train_micro_batch_size_per_gpu']
     
     # 加载数据
-    var_index = torch.load('data/var_index.pt')
+    var_index = torch.load(os.path.join(cfg.data.out_dir, "var_index.pt"))
     
     # 从 var_index 自动识别 depth
     depth = int(torch.max(var_index).item()) + 1  # add missing
@@ -293,16 +348,18 @@ def main():
     
     # 创建数据集
     train_dataset = GeneticDataset(
-        'data/train_randomdis.pt', 
+        os.path.join(cfg.data.out_dir, "train.pt"), 
         cfg.train.n_var, 
         cfg.train.site_overlap, 
-        is_train=True
+        is_train=True,
+        cfg=cfg
     )
     val_dataset = GeneticDataset(
-        'data/val_randomdis.pt', 
+        os.path.join(cfg.data.out_dir, "val.pt"), 
         cfg.train.n_var, 
         site_overlap=0,
-        is_train=False
+        is_train=False,
+        cfg=cfg
     )
     
     # 创建固定测试样本集
@@ -329,6 +386,17 @@ def main():
 
     if ds_dist.get_rank() == 0:
         os.makedirs(cfg.train.save_dir, exist_ok=True)
+        os.makedirs(cfg.train.logs_dir, exist_ok=True)
+        logs_path = Path(cfg.train.logs_dir, "train_loss.csv")
+        # 第一次写时写表头
+        if not os.path.exists(logs_path):
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+            logs_path = Path(cfg.train.logs_dir) / f"{timestamp}.csv"
+            with open(logs_path, "w", newline="") as f:
+                w = csv.writer(f, delimiter=",")
+                w.writerow([f"# config.json={export_config(cfg, separators=(',', ':'))}"])
+                w.writerow([f"# ds_config.json={json.dumps(ds_config, separators=(',', ':'))}"])
+                w.writerow(["epoch","batch", "train_loss", "train_acc", "train4test_acc", "val_acc"])
     ds_dist.barrier()          # 等 rank0 建完目录
         
     # 使用包装的数据加载器
@@ -366,7 +434,7 @@ def main():
             
             for batch_idx, batch in enumerate(train_loader):
                 var_sites = batch['var_sites'].to(model_engine.device)
-                dist_mat = batch['dist_mat'].to(model_engine.device)
+                dist_mat = batch['dist_mat'].to(model_engine.device) if batch['dist_mat'] is not None else None
                 site_ranges = torch.tensor(
                     [[s, e] for s, e in batch['site_ranges']], 
                     dtype=torch.long, 
@@ -377,10 +445,6 @@ def main():
                 if var_sites.dtype != torch.long:
                     var_sites = var_sites.long()
                 
-                weight_dtype = next(model_engine.parameters()).dtype
-                if dist_mat.dtype != weight_dtype:
-                    dist_mat = dist_mat.to(weight_dtype)
-                
                 mask = _make_valid_mask(site_ranges, var_sites.size(1), var_sites.device)
                 if mask.sum() == 0:           # 本 batch 无有效位点
                     if ds_dist.get_rank() == 0:
@@ -390,7 +454,8 @@ def main():
                 predictions = model_engine(var_sites, dist_mat)
                 
                 # 计算损失
-                loss = masked_cross_entropy(predictions, var_sites, site_ranges)
+                # loss = masked_cross_entropy(predictions, var_sites, site_ranges)
+                loss = masked_imputation_loss(predictions, var_sites, site_ranges, use_r2=True)
 
                 # 反向传播
                 model_engine.backward(loss)
@@ -409,6 +474,10 @@ def main():
                         'loss': f'{loss.item():.4f}',
                         'acc': f'{accuracy:.4f}'
                     })
+                    with open(logs_path, "a", newline="") as f:
+                        csv.writer(f).writerow(
+                            [epoch + 1, batch_idx+1, loss.item(), accuracy, None, None]
+                        )
                     progress_bar.update(1)
             
             # 关闭进度条
@@ -420,6 +489,12 @@ def main():
             avg_accuracy = epoch_accuracy / processed_batches
             
             print_rank0(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.4f}")
+
+            if ds_dist.get_rank() == 0:
+                with open(logs_path, "a", newline="") as f:
+                    csv.writer(f).writerow(
+                        [epoch + 1, "average", avg_loss, avg_accuracy, None, None]
+                    )
             
             # ---------------- 验证 & 早停 ----------------
             if (epoch + 1) % cfg.train.val_interval == 0:
@@ -434,6 +509,11 @@ def main():
                 )
 
                 print_rank0(f"Train Mask Accuracy: {train_accuracy:.4f}, Val Mask Accuracy: {val_accuracy:.4f}")
+                if ds_dist.get_rank() == 0:
+                    with open(logs_path, "a", newline="") as f:
+                        csv.writer(f).writerow(
+                            [epoch + 1, "average", avg_loss, avg_accuracy, train_accuracy, val_accuracy]
+                        )
                 
                 # ====== 早停逻辑（仅在 rank0 进行） ======
                 save_best = torch.tensor(0, dtype=torch.long, device=model_engine.device)   # 1=需要保存

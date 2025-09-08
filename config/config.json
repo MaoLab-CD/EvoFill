@@ -1,12 +1,10 @@
 {
   "data": {
-    "out_dir": "data",
-    "train_vcf"   : "data/sim_0901/scenario1_east_asian_chr22_train.vcf.gz",
-    "train_dismat" : "data/sim_0901/scenario1_east_asian_chr22_train.p_dis.mat",
-    "val_vcf"   : "data/sim_0901/scenario1_east_asian_chr22_val.vcf.gz",
-    "val_dismat" : "data/sim_0901/scenario1_east_asian_chr22_val.p_dis.mat",
-    "tihp": "True",
-    "random_dis": "False"
+    "out_dir": "data/sim_s2_250901/",
+    "train_vcf" : "data/sim_s2_250901/YRI_CEU_chr22.vcf.gz",
+    "val_vcf"   : "data/sim_s2_250901/CHB_chr22.vcf.gz",
+    "fst_mat"   : "data/sim_s2_250901/fst_matrix.csv",
+    "tihp": "True"
   },
   "model": {
     "embed_dim": 64,
@@ -15,18 +13,20 @@
     "dropout": 0.1
   },
   "train": {
+    "use_fst": "False",
     "batch_size": 256,
     "dataloader_workers": 32,
     "n_var": 2000,
     "site_overlap": 500,
     "epochs": 100,
-    "mask_ratio": 0.3,
-    "train4test": 300,
-    "val_interval": 10,
-    "save_interval": 10,
-    "save_dir": "./ckpt_randomdis",
+    "mask_ratio": 0.5,
+    "train4test": 500,
+    "val_interval": 1,
+    "save_interval": 1,
+    "save_dir": "./ckpt",
+    "logs_dir": "./logs",
     "early_stop": {
-      "patience": 2,
+      "patience": 5,
       "min_delta": 0.001
     }
   }
