@@ -1,6 +1,6 @@
 
 '''
-deepspeed --num_gpus 2 train.py
+deepspeed --num_gpus 1 train.py
 '''
 import os
 import csv
@@ -242,7 +242,7 @@ def masked_imputation_loss(predictions, targets, site_ranges, use_r2=True, group
 
     # 2. KL loss
     log_probs = F.log_softmax(logits_valid, dim=-1)
-    probs = F.softmax(logits_valid, dim=-1)
+    # probs = F.softmax(logits_valid, dim=-1)
     tgt_onehot = F.one_hot(tgt_valid, num_classes=D).float()
     kl_loss = F.kl_div(log_probs, tgt_onehot, reduction='sum')
 
@@ -337,7 +337,8 @@ def main():
     with open("config/ds_config.json", 'r') as f:
         ds_config = json.load(f)
 
-    cfg.train.batch_size = ds_config['train_micro_batch_size_per_gpu']
+    ds_config['train_batch_size'] = ds_config['train_micro_batch_size_per_gpu'] * ds_config['gradient_accumulation_steps'] * num_gpus
+    cfg.train.batch_size = ds_config['train_batch_size']
     
     # 加载数据
     var_index = torch.load(os.path.join(cfg.data.out_dir, "var_index.pt"))
@@ -455,7 +456,7 @@ def main():
                 
                 # 计算损失
                 # loss = masked_cross_entropy(predictions, var_sites, site_ranges)
-                loss = masked_imputation_loss(predictions, var_sites, site_ranges, use_r2=True)
+                loss = masked_imputation_loss(predictions, var_sites, site_ranges, use_r2=False)
 
                 # 反向传播
                 model_engine.backward(loss)
