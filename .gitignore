@@ -1,3 +1,4 @@
 data/*
 ckpt*
 src/__pycache__/*
+logs/*

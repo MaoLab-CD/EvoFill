@@ -1,241 +1,169 @@
 """
-EvoFill – 加入遗传距离的 STICI 改进版
-依赖: flash-attn>=2.6
+超长序列缺失填充（Mamba2 + 权重偏移 +多卡串联）
+OMP_NUM_THREADS=8 torchrun --nproc_per_node=2 src/model_condssm.py
 """
+
+import os
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from flash_attn import flash_attn_func
+import torch.distributed as dist
+from torch import nn
+from src.mamba2_cond import Mamba2
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-from src.utils import load_config
+# 并行参数
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+dist.init_process_group(backend="nccl", device_id=torch.cuda.current_device())
+world_size = dist.get_world_size()
+rank = dist.get_rank()
 
-# --------------------------------------------------
-# 基础组件
-# --------------------------------------------------
-class FlashMultiHeadAttention(nn.Module):
-    """
-    序列维度 Flash-Attention；对 (batch, seqlen, dim) 做自注意力
-    """
-    def __init__(self, embed_dim, num_heads, dropout=0.0):
+# ---------- 2. 模型 ----------
+class PerDeviceMamba(nn.Module):
+    def __init__(self, n_cats=10, k=4, d_model=512, d_state=64, d_conv=4, n_layers=4, **mamba_kwargs):
         super().__init__()
-        assert embed_dim % num_heads == 0
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
-        self.proj = nn.Linear(embed_dim, embed_dim)
-        self.dropout = dropout
-
-    def forward(self, x):
-        # x: (B, L, D)
-        B, L, _ = x.shape
-        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, L, Dh)
-        out = flash_attn_func(q, k, v, dropout_p=self.dropout, causal=False)
-        out = out.reshape(B, L, -1)
-        return self.proj(out)
-
-
-class SampleFlashAttention(nn.Module):
-    """
-    样本维度 Flash-Attention：在样本维度做注意力，遗传距离作为偏置。
-    使用手动实现的注意力来处理距离偏置。
-    """
-    def __init__(self, embed_dim, num_heads, dropout=0.0):
-        super().__init__()
-        assert embed_dim % num_heads == 0
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
-        self.proj = nn.Linear(embed_dim, embed_dim)
-        self.dropout = dropout
-        self.dropout_layer = nn.Dropout(dropout)
-
-    def forward(self, x, dist_bias):
-        """
-        x: (N, L, D)          N = n_samples, L = seqlen
-        dist_bias: (N, N)    遗传距离矩阵，作为注意力偏置
-        """
-        N, L, D = x.shape
-        
-        # 确保 dist_bias 与 x 的数据类型一致
-        dist_bias = dist_bias.to(x.dtype)
-        
-        qkv = self.qkv(x).reshape(N, L, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)   # (3, N, H, L, Dh)
-        
-        # 确保 q, k, v 的数据类型一致
-        q = q.to(x.dtype)
-        k = k.to(x.dtype)
-        v = v.to(x.dtype)
-        
-        # 转置为 (N, H, L, Dh) -> (H, L, N, Dh) 以便在样本维度计算注意力
-        q = q.permute(1, 2, 0, 3)  # (H, L, N, Dh)
-        k = k.permute(1, 2, 0, 3)  # (H, L, N, Dh)
-        v = v.permute(1, 2, 0, 3)  # (H, L, N, Dh)
-        
-        # 计算注意力分数
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (H, L, N, N)
-        
-        # 添加距离偏置，扩展维度以匹配注意力分数
-        dist_bias = dist_bias.unsqueeze(0).unsqueeze(0)  # (1, 1, N, N)
-        dist_bias = dist_bias.expand(self.num_heads, L, -1, -1)  # (H, L, N, N)
-        
-        attn_scores = attn_scores + dist_bias
-        
-        # 计算注意力权重
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout_layer(attn_weights)
-        
-        # 确保注意力权重和 v 的数据类型一致
-        attn_weights = attn_weights.to(v.dtype)
-        
-        # 应用注意力权重
-        out = torch.matmul(attn_weights, v)  # (H, L, N, Dh)
-        
-        # 重新排列维度
-        out = out.permute(2, 0, 1, 3)  # (N, H, L, Dh)
-        out = out.reshape(N, L, -1)  # (N, L, H * Dh)
-        
-        return self.proj(out)
-
-
-class FFN(nn.Module):
-    def __init__(self, dim, ff_mult=4, dropout=0.0):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, dim * ff_mult),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * ff_mult, dim),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class FlashTransformerBlock(nn.Module):
-    """
-    序列自注意力 + 样本注意力 + FFN
-    """
-    def __init__(self, embed_dim, num_heads, dropout=0.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.seq_attn = FlashMultiHeadAttention(embed_dim, num_heads, dropout)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.sample_attn = SampleFlashAttention(embed_dim, num_heads, dropout)
-        self.norm3 = nn.LayerNorm(embed_dim)
-        self.ffn = FFN(embed_dim, dropout=dropout)
-
-    def forward(self, x, dist_mat):
-        """
-        x: (N, L, D)
-        dist_mat: (N, N)
-        """
-        # 确保 dist_mat 与 x 的数据类型一致
-        dist_mat = dist_mat.to(x.dtype)
-        
-        # 1) 序列维度自注意力
-        x = x + self.seq_attn(self.norm1(x))
-        # 2) 样本维度交叉注意力（遗传距离作为偏置）
-        x = x + self.sample_attn(self.norm2(x), dist_mat)
-        # 3) FFN
-        x = x + self.ffn(self.norm3(x))
-        return x
-
-
-# --------------------------------------------------
-# 主模型
-# --------------------------------------------------
-class EvoFill(nn.Module):
-    def __init__(self,
-                 depth: int = 3,
-                 embed_dim: int = 64,
-                 num_heads: int = 8,
-                 n_layers: int = 4,
-                 dropout: float = 0.1):
-        super().__init__()
-        self.depth = depth  # 有效类别数（不包含 missing）
-        self.embed = nn.Linear(depth + 1, embed_dim, bias=False)  # 输入维度 depth+1（包含 missing）
-        self.blocks = nn.ModuleList([
-            FlashTransformerBlock(embed_dim, num_heads, dropout) for _ in range(n_layers)
+        self.embed = nn.Embedding(n_cats + 1, d_model)
+        self.layers = nn.ModuleList([
+            Mamba2(k=k, d_model=d_model, d_state=d_state, d_conv=d_conv, **mamba_kwargs)
+            for _ in range(n_layers)
         ])
-        self.out_proj = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, depth)  # 输出 depth 个类别（不包含 missing）
+        self.head = nn.Linear(d_model, n_cats)
+
+    def forward(self, x_chunk, feat, h_prev=None):
+        """
+        x_chunk : (B, L)  int64
+        feat    : (B, k)
+        h_prev  : (B, d_model)  仅用于推理
+        return:
+            logits : (B, L, n_cats)
+            h_next : (B, d_model)
+        """
+        B, L = x_chunk.shape
+        tok = self.embed(x_chunk)
+        if h_prev is not None:
+            tok[:, 0] = tok[:, 0] + h_prev
+        x = tok
+        for layer in self.layers:
+            x = layer(x, feat=feat)
+        logits = self.head(x)
+        h_next = x[:, -1]
+        return logits, h_next
+
+
+class DistributedMamba(nn.Module):
+    """
+    包装器：负责把序列切到不同 GPU, 并循环传递隐藏状态。
+    超参全部在这里暴露，方便一键调参。
+    """
+    def __init__(self,
+                 n_cats=10,
+                 k=4,
+                 d_model=512,
+                 d_state=64,
+                 d_conv=4,
+                 n_layers=4,
+                 **mamba_kwargs):
+        """
+        mamba_kwargs 留给未来扩展（如 expand, headdim 等）
+        """
+        super().__init__()
+        self.subnet = PerDeviceMamba(
+            n_cats=n_cats,
+            k=k,
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            n_layers=n_layers,
+            **mamba_kwargs
         )
-        
-    def forward(self, x: torch.Tensor, dist_mat: torch.Tensor):
-        """
-        x: (N, L) 整型矩阵，数值范围 0-depth (depth 代表 missing)
-        dist_mat: (N, N) 遗传距离矩阵
-        return: (N, L, depth) 概率矩阵（不包含 missing）
-        """
+        # 用 DDP 包装，梯度会自动 all-reduce
+        self.subnet = DDP(self.subnet.cuda(local_rank),
+                          device_ids=[local_rank],
+                          output_device=local_rank,
+                          find_unused_parameters=True)
+        self.n_cats = n_cats
+        self.ignore_index = n_cats   # PAD token 不参与 loss
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=self.ignore_index, reduction='sum')
 
-        # 创建 one-hot 编码（使用原始输入，包含 missing）
-        if x.dtype != torch.long:
-            x = x.long()
-        x_one_hot = F.one_hot(x, num_classes=self.depth + 1).float()
-        
-        # 确保数据类型一致
-        weight_dtype = next(self.parameters()).dtype
-        if x_one_hot.dtype != weight_dtype:
-            x_one_hot = x_one_hot.to(weight_dtype)
-        
-        # 嵌入层
-        x_emb = self.embed(x_one_hot)  # (N, L, embed_dim)
-        
-        # 通过所有 transformer block
-        for blk in self.blocks:
-            x_emb = blk(x_emb, dist_mat)
-        
-        # 输出投影到 depth 维度（不包含 missing）
-        logits = self.out_proj(x_emb)  # (N, L, depth)
-        
-        # 对于 missing 位置，我们可以选择保持预测或者进行特殊处理
-        # 这里直接返回 softmax 结果
-        return F.softmax(logits, dim=-1)
-
-    def predict(self, x: torch.Tensor, dist_mat: torch.Tensor):
+    def forward(self, seq, feat, labels=None):
         """
-        预测方法：返回最可能的类别
+        seq    : (B, N)  int64
+        feat   : (B, k)  float
+        labels : (B, N)  int64  (与 seq 对齐，缺失位置=PAD)
+        return:
+            loss   : scalar (已跨卡平均)
+            logits : (B, N, n_cats) 仅在 rank0 返回
         """
-        probs = self.forward(x, dist_mat)
-        return torch.argmax(probs, dim=-1)
+        B, N = seq.shape
+        chunk_len = N // world_size
+        my_seq   = seq[:, rank*chunk_len:(rank+1)*chunk_len].cuda(local_rank)
+        my_feat  = feat.cuda(local_rank)
+        logits, _ = self.subnet(my_seq, my_feat)   # (B, L, n_cats)
+
+        # 收集全局 logits 到 rank0（用于评估/生成）
+        if rank == 0:
+            full_logits = torch.empty(B, N, self.n_cats, dtype=logits.dtype, device=logits.device)
+            full_logits[:, :chunk_len] = logits
+            for src in range(1, world_size):
+                recv_buf = torch.empty_like(logits)
+                dist.recv(recv_buf, src=src)
+                full_logits[:, src*chunk_len:(src+1)*chunk_len] = recv_buf
+        else:
+            dist.send(logits, dst=0)
+            full_logits = None
+
+        # 计算损失
+        if labels is not None:
+            my_labels = labels[:, rank*chunk_len:(rank+1)*chunk_len].cuda(local_rank)
+            loss = self.loss_fn(logits.view(-1, self.n_cats), my_labels.view(-1))
+            
+            loss = loss / B
+        else:
+            loss = None
+
+        return loss, full_logits
 
 
-# --------------------------------------------------
-# 本地测试
-# --------------------------------------------------
+# ---------- 3. 测试 ----------
 if __name__ == "__main__":
-    import torch.cuda as cuda
-    from torch.amp import autocast
-    device = torch.device("cuda" if cuda.is_available() else "cpu")
+    # ---------- 配置 ----------
+    B = 1                # batch_size
+    N = 1_000_000        # 序列长度
+    n_cats = 15          # 类别数
+    k = 4                # 样本特征维
+    PAD = n_cats         # 缺失 token
 
-    cfg = load_config('config/config.json')
-    depth = 15  # 有效类别数
+    torch.cuda.reset_peak_memory_stats()  # 重置峰值统计
+    torch.manual_seed(42)
+    # 构造数据
+    seq   = torch.randint(0, n_cats, (B, N))          # 无 PAD
+    mask  = torch.rand(B, N) < 0.30
+    seq[mask] = PAD
+    labels = seq.clone()                              # 与输入对齐
+    feat  = torch.randn(B, k)
 
-    model = EvoFill(depth=depth, 
-                    embed_dim=cfg.model.embed_dim,
-                    num_heads=cfg.model.n_heads,
-                    n_layers=cfg.model.n_layers,
-                    dropout=cfg.model.dropout).to(device)
+    feat = torch.randn(B, k)
 
-    B, L = cfg.train.batch_size, cfg.train.n_var
-    # 输入范围：0-3 (3 代表 missing)
-    x = torch.randint(0, depth + 1, (B, L), device=device)
-    dist = torch.rand(B, B, device=device)
+    model = DistributedMamba(n_cats=n_cats, k=k, 
+                             d_model=512,   d_state=128,
+                             d_conv=4,      n_layers=6)
+    model.train()
 
-    with autocast("cuda", enabled=True):
-        out = model(x, dist)
-        print("Input :", x.shape)      # (B, L)
-        print("Input range:", x.min().item(), "-", x.max().item())  # 0-3
-        print("Dist  :", dist.shape)   # (B, B)
-        print("Output:", out.shape)    # (B, L, depth) - 不包含 missing
-        print("Output range:", out.min().item(), "-", out.max().item())  # 概率值
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-    print(f"Peak GPU memory: {cuda.max_memory_allocated(device)/1024**2:.2f} MB")
-    print(f"Output is probability distribution: {torch.allclose(out.sum(dim=-1), torch.ones(B, L, device=device), atol=1e-6)}")
+    # 前向 + 反向
+    loss, full_logits = model(seq, feat, labels)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    dist.barrier()
+    if rank == 0:
+        print(f"Loss: {loss.item():.4f}")
+        print("输入序列 shape :", seq.shape)         # (1, 1_000_000)
+        print("样本特征 shape :", feat.shape)        # (1, 4)
+        print("输出 logits    :", full_logits.shape)   # (1, 1_000_000, 15)
+
+    max_memory = torch.cuda.max_memory_allocated() / 1024**2
+    print(f"[Rank {rank}] 显存使用: {max_memory:,.1f} MB")
+
+    dist.destroy_process_group()
