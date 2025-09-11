@@ -1,9 +1,9 @@
 {
   "data": {
-    "out_dir": "data/sim_s2_250901/",
-    "train_vcf" : "data/sim_s2_250901/YRI_CEU_chr22.vcf.gz",
-    "val_vcf"   : "data/sim_s2_250901/CHB_chr22.vcf.gz",
-    "fst_mat"   : "data/sim_s2_250901/fst_matrix.csv",
+    "out_dir": "data/sim_0910/",
+    "train_vcf" : "data/sim_0910/PopA.vcf.gz",
+    "val_vcf"   : "data/sim_0910/PopB.vcf.gz",
+    "fst_mat"   : "data/sim_0910/fst_matrix.csv",
     "tihp": "True"
   },
   "model": {

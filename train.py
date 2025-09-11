@@ -19,9 +19,7 @@ from src.model import EvoFill
 from src.utils import load_config, export_config
 from tqdm import tqdm
 
-# --------------------------------------------------
 # 数据集类
-# --------------------------------------------------
 class GeneticDataset(Dataset):
     def __init__(self,  data_path, n_var, site_overlap=0, is_train=True, cfg=None):
 
