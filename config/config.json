@@ -1,33 +1,12 @@
 {
-  "data": {
-    "out_dir": "data/sim_0910/",
-    "train_vcf" : "data/sim_0910/PopA.vcf.gz",
-    "val_vcf"   : "data/sim_0910/PopB.vcf.gz",
-    "fst_mat"   : "data/sim_0910/fst_matrix.csv",
-    "tihp": "True"
-  },
-  "model": {
-    "embed_dim": 64,
-    "n_heads": 8,
-    "n_layers": 4,
-    "dropout": 0.1
-  },
-  "train": {
-    "use_fst": "False",
-    "batch_size": 256,
-    "dataloader_workers": 32,
-    "n_var": 1000,
-    "site_overlap": 200,
-    "epochs": 100,
-    "mask_ratio": 0.5,
-    "train4test": 500,
-    "val_interval": 1,
-    "save_interval": 1,
-    "save_dir": "./ckpt",
-    "logs_dir": "./logs",
-    "early_stop": {
-      "patience": 5,
-      "min_delta": 0.001
-    }
-  }
+  "ref_fa": "/mnt/qmtang/EvoFill/data/hg19_chr22/chr22.fa.gz",
+  "vcf": "/mnt/qmtang/EvoFill/data/sim_0910/PopA.vcf.gz",
+  "T": 500,
+  "d": 256,
+  "bs": 32,
+  "lr": 2e-4,
+  "epochs": 100,
+  "out_dir": "./data/preemb_chr22",
+  "cache": "./data/preemb_chr22/cahce.npy",
+  "cache_overwrite": true
 }
