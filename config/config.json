@@ -30,5 +30,10 @@
       "patience": 5,
       "min_delta": 0.001
     }
+  },
+  "infer": {
+    "input_vcf": "data/sim_s2_250901/CHB_chr22.missing50.vcf.gz",
+    "output_vcf": "data/sim_s2_250901/CHB_chr22.imputed.vcf.gz",
+    "batch_size": 1024
   }
 }

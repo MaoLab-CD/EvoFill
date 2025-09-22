@@ -11,6 +11,8 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from src.utils import load_config
 from src.model import MambaImputer
+from src.losses import ImputationLoss
+
 
 
 def print0(*args, **kwargs):
@@ -100,6 +102,7 @@ def main():
         model, device_ids=[local_rank], output_device=local_rank
     )
 
+    loss_fn = ImputationLoss(n_cats=n_cats, ignore_index=pad_idx, group_size=4, use_r2=False).cuda()
     optimizer = AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
 
     # ---------- DataLoader ----------
@@ -142,9 +145,7 @@ def main():
         for seq, labels in iterator:
             seq, labels = seq.cuda(), labels.cuda()
             logits = model(seq)
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, n_cats), labels.view(-1), ignore_index=pad_idx
-            )
+            loss = loss_fn(logits.view(-1, n_cats), labels.view(-1))
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -154,13 +155,13 @@ def main():
 
         if rank == 0:
             epoch_loss /= len(train_loader.dataset)
-            print0(f"Epoch {epoch:03d} | epoch_loss = {epoch_loss:.4f}")
+            print0(f"TRAIN {epoch:03d} | epoch_loss = {epoch_loss:.4f}")
 
         # ---------- 验证 ----------
         if epoch % val_interval == 0 or epoch == epochs:
             val_acc = mask_accuracy(model, val_loader, epoch, mask_ratio, pad_idx)
             if rank == 0:
-                print0(f"Epoch {epoch:03d} | val_mask_acc = {val_acc:.4f}")
+                print0(f"TEST {epoch:03d} | test_mask_acc = {val_acc:.4f}")
                 if val_acc > best_acc + patience_delta:
                     best_acc = val_acc
                     patience_counter = 0

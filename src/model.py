@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 from mamba_ssm import Mamba2  # 官方实现
+from src.losses import ImputationLoss
 
 class MambaImputer(nn.Module):
     """
@@ -25,7 +26,7 @@ class MambaImputer(nn.Module):
             for _ in range(n_layers)
         ])
         self.head     = nn.Linear(d_model, n_cats)
-        self.loss_fn  = nn.CrossEntropyLoss(ignore_index=self.ignore_idx, reduction='mean')
+        self.loss_fn  = ImputationLoss(n_cats=n_cats, ignore_index=self.ignore_idx, group_size=4, use_r2=True)
 
     def forward(self, x, labels=None):
         """
