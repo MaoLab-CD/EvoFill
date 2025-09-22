@@ -1,6 +1,6 @@
 {
   "data": {
-    "out_dir": "data",
+    "out_dir": "data/sim_0901",
     "train_vcf"   : "data/sim_0901/scenario1_east_asian_chr22_train.vcf.gz",
     "train_dismat" : "data/sim_0901/scenario1_east_asian_chr22_train.p_dis.mat",
     "val_vcf"   : "data/sim_0901/scenario1_east_asian_chr22_val.vcf.gz",
@@ -13,17 +13,19 @@
     "d_model": 512,
     "d_state": 128,
     "d_conv": 4,
-    "n_layers": 6
+    "n_layers": 6,
+    "expand": 2,
+    "headdim": 64
   },
   "train": {
-    "batch_size": 1,
-    "lr": 1e-3,
+    "batch_size": 2,
+    "lr": 3e-4,
     "weight_decay": 0.01,
     "epochs": 100,
-    "mask_ratio": 0.5,
-    "val_interval": 10,
+    "val_interval": 2,
+    "mask_ratio": 0.3,
     "save_interval": 10,
-    "save_dir": "ckpt",
+    "save_dir": "checkpoints",
     "early_stop": {
       "patience": 5,
       "min_delta": 0.001
