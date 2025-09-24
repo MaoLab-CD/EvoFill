@@ -1,35 +1,30 @@
 {
   "data": {
-    "out_dir": "data/sim_0901",
-    "train_vcf"   : "data/sim_0901/scenario1_east_asian_chr22_train.vcf.gz",
-    "train_dismat" : "data/sim_0901/scenario1_east_asian_chr22_train.p_dis.mat",
-    "val_vcf"   : "data/sim_0901/scenario1_east_asian_chr22_val.vcf.gz",
-    "val_dismat" : "data/sim_0901/scenario1_east_asian_chr22_val.p_dis.mat",
-    "tihp": "True",
-    "random_dis": 0,
-    "k": 5
+    "genome_json": "config/h38_coords.json",
+    "path": "data/sim_s2_250901",
+    "train_vcf"   : "data/sim_s2_250901/YRI_CEU_chr22.vcf.gz",
+    "val_vcf"   : "data/sim_s2_250901/CHB_chr22.bgzf.vcf.gz",
+    "tihp": "True"
   },
   "model": {
-    "d_model": 512,
+    "n_cats": 8,
+    "n_chunks": 4,
+    "d_model": 256,
+    "n_layers": 4,
+    "chunk_overlap_ratio": 0.1,
     "d_state": 128,
-    "d_conv": 4,
-    "n_layers": 6,
-    "expand": 2,
-    "headdim": 64
+    "expand": 2
   },
   "train": {
-    "batch_size": 2,
-    "lr": 3e-4,
+    "batch_size": 8,
+    "lr": 1e-3,
     "weight_decay": 0.01,
-    "epochs": 100,
-    "val_interval": 2,
-    "mask_ratio": 0.3,
-    "save_interval": 10,
-    "save_dir": "checkpoints",
-    "early_stop": {
-      "patience": 5,
-      "min_delta": 0.001
-    }
+    "num_epochs": 10,
+    "mask_ratio": 0.5,
+    "patience" : 5,
+    "min_delta": 0.0001,
+    "device": "cuda:0",
+    "save":  "ckpt"
   },
   "infer": {
     "input_vcf": "data/sim_s2_250901/CHB_chr22.missing50.vcf.gz",
