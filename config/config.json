@@ -1,6 +1,6 @@
 {
   "data": {
-    "genome_json": "config/h38_coords.json",
+    "genome_json": "/home/qmtang/mnt_qmtang/EvoFill/config/h38_coords.json",
     "path": "data/sim_s2_250901",
     "train_vcf"   : "data/sim_s2_250901/YRI_CEU_chr22.vcf.gz",
     "val_vcf"   : "data/sim_s2_250901/CHB_chr22.bgzf.vcf.gz",
@@ -19,7 +19,7 @@
     "batch_size": 8,
     "lr": 1e-3,
     "weight_decay": 0.01,
-    "num_epochs": 10,
+    "num_epochs": 1000,
     "mask_ratio": 0.5,
     "patience" : 5,
     "min_delta": 0.0001,
