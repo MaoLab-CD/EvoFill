@@ -21,8 +21,10 @@
     "weight_decay": 0.01,
     "num_epochs": 1000,
     "mask_ratio": 0.5,
-    "patience" : 5,
-    "min_delta": 0.0001,
+    "patience" : 10,
+    "min_delta": 0.0,
+    "use_r2_loss": "False",
+    "use_grad_norm": "Fasle",
     "device": "cuda:0",
     "save":  "ckpt"
   },

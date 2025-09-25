@@ -125,7 +125,7 @@ def validate(model, loader, criterion, device):
 
 
 class EarlyStopper:
-    def __init__(self, patience=10, min_delta=0.0, mode='min'):
+    def __init__(self, patience=10, min_delta=0.0, mode='min', save_dir='./ckpt'):
         assert mode in {'min', 'max'}
         self.patience = patience
         self.min_delta = min_delta
@@ -133,6 +133,7 @@ class EarlyStopper:
         self.counter = 0
         self.best = None
         self.best_state = None
+        self.save_dir = save_dir
 
     def __call__(self, metric, model):
         if self.best is None:
@@ -146,6 +147,8 @@ class EarlyStopper:
         if better:
             self.best = metric
             self.best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            torch.save(self.best_state, self.save_dir / "evofill_best.pt")
+            print(f"Best model updated: {self.save_dir / 'evofill_best.pt'}")
             self.counter = 0
         else:
             self.counter += 1
@@ -171,19 +174,26 @@ def main():
         mask_ratio=cfg.train.mask_ratio,
     )
 
-    # 模型 & 优化器
+    # 模型
     model = EvoFill(**vars(cfg.model)).to(device)
 
+    # 损失
     criterion = ImputationLoss(use_r2_loss=True,
                            use_grad_norm=True,
                            gn_alpha=1.5,
                            gn_lr_w=cfg.train.lr/10).to(device) #权重学习率，比模型 lr 小 1~2 量级
 
+    # 优化器
     optimizer = AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
 
+    # 早停
     early_stopper = EarlyStopper(patience=cfg.train.patience,
                                  min_delta=cfg.train.min_delta,
-                                 mode='min')
+                                 mode='min',
+                                 save_dir = Path(cfg.train.save))
+
+    save_dir = Path(cfg.train.save)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     # 训练循环
     for epoch in range(1, cfg.train.num_epochs + 1):
@@ -196,10 +206,8 @@ def main():
             break
 
     # 保存最优模型
-    save_dir = Path(cfg.train.save)
-    save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(early_stopper.best_state, save_dir / "evofill_best.pt")
-    print(f"Best model saved to {save_dir / 'evofill_best.pt'} (epoch {epoch - early_stopper.counter})")
+    print(f"Best model updated: {save_dir / 'evofill_best.pt'} (epoch {epoch - early_stopper.counter})")
 
 if __name__ == "__main__":
     main()

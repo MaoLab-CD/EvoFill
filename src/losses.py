@@ -97,7 +97,7 @@ class ImputationLoss(nn.Module):
         r2 = torch.where(mask, 0.0, r2)
         return r2
 
-    # ---------- R2 loss（改为 -1/log(r2)） ---------- #
+    # ---------- R2 loss（改为 1/log(r2)） ---------- #
     def _r2_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor, mask_valid: torch.Tensor):
         B, V, C = y_pred.shape
         G = self.group_size
