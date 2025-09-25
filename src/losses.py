@@ -130,7 +130,7 @@ class ImputationLoss(nn.Module):
         if rem:
             r2_penalty += one_group(slice(num_full * G, B))
 
-        return 1.0 / torch.log(r2_penalty + 1e-6)
+        return 1.0 / torch.log(r2_penalty + self.eps)
 
     # ---------- 前向 ---------- #
     def forward(self, y_pred, y_true):
@@ -141,7 +141,7 @@ class ImputationLoss(nn.Module):
         # 1. MCE 改为 mean
         log_p = F.log_softmax(y_pred, dim=-1)
         ce = -log_p.gather(dim=-1, index=y_true_m.long().unsqueeze(-1)).squeeze(-1)
-        ce = (ce * mask_valid).sum() / (mask_valid.sum() + self.eps)   # ← 关键改动
+        ce = (ce * mask_valid).sum() / (mask_valid.sum() + self.eps)
         # 2. R²
         r2 = 0.
         if self.use_r2_loss:
@@ -149,7 +149,9 @@ class ImputationLoss(nn.Module):
 
         # 3. GradNorm 或固定系数
         if self.use_gn:
-            losses = torch.stack([ce, r2])
-            return self.gn_loss(losses)
+            losses = torch.stack([ce, 10*r2])
+            gn_loss = self.gn_loss(losses)
+            # print('ce:',ce,'r2:',r2, 'gn_loss:', gn_loss)
+            return gn_loss
         else:
             return ce + 10 * r2

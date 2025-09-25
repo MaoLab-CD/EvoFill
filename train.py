@@ -1,17 +1,13 @@
 import torch
 from pathlib import Path
-
+import numpy as np
+import random
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from tqdm import tqdm
 from src.utils import load_config
 from src.model import EvoFill
 from src.losses import ImputationLoss
-
-
-# def print0(*args, **kwargs):
-#     if dist.get_rank() == 0:
-#         print(*args, **kwargs)
 
 
 class GenotypeDataset(Dataset):
@@ -109,7 +105,7 @@ def validate(model, loader, criterion, device):
                                      coords.to(device)
 
         logits = model(gt_mask, coords)          # (B, L, n_cats)
-        loss   = criterion(logits, gt_true)      # 计算与真值差异
+        loss   = criterion(logits, gt_true) 
 
         # 只统计被 mask 的位点
         mask = gt_mask == -1
@@ -158,7 +154,13 @@ class EarlyStopper:
 def main():
     cfg = load_config("config/config.json")
     device = torch.device(cfg.train.device)
-    torch.manual_seed(42)
+
+    # 随机种子
+    seed = cfg.train.seed
+    random.seed(seed)
+    np.random.seed(seed) 
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
     # 数据
     train_loader = build_loader(
@@ -180,7 +182,7 @@ def main():
     # 损失
     criterion = ImputationLoss(use_r2_loss=True,
                            use_grad_norm=True,
-                           gn_alpha=1.5,
+                           gn_alpha=0.8,
                            gn_lr_w=cfg.train.lr/10).to(device) #权重学习率，比模型 lr 小 1~2 量级
 
     # 优化器
