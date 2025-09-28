@@ -118,22 +118,21 @@ class EvoFill(nn.Module):
     def __init__(
         self,
         n_cats: int,
-        n_chunks: int,
+        chunk_size: int,
         d_model: int = 256,
         n_layers: int = 4,
-        chunk_overlap_ratio: float = 0.1,
+        chunk_overlap: int = 64,          # 直接指定 overlap 长度
         **mamba_kwargs,
     ):
         super().__init__()
         self.n_cats = n_cats
-        self.n_chunks = n_chunks
-        self.chunk_overlap_ratio = chunk_overlap_ratio
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
 
         self.embed = CatEmbeddings(n_cats, d_model)
-        self.chunk_modules = nn.ModuleList([
-            ChunkModule(d_model, n_layers, **mamba_kwargs)
-            for _ in range(n_chunks)
-        ])
+        # 只实例化一个 ChunkModule，所有 chunk 共享权重
+        self.chunk_module = ChunkModule(d_model, n_layers, **mamba_kwargs)
+
         self.length_proj = nn.Sequential(
             nn.Conv1d(d_model, d_model, kernel_size=3, padding=1),
             nn.GELU(),
@@ -141,49 +140,68 @@ class EvoFill(nn.Module):
         self.out_conv = nn.Conv1d(d_model, n_cats, kernel_size=1)
 
     def forward(self, x: torch.Tensor, x_coord: torch.Tensor):
+        """
+        x:       (B, L)        long，-1 表示 padding
+        x_coord: (L, 4)        float
+        return:  (B, L, n_cats)
+        """
         B, L_orig = x.shape
+        device = x.device
 
-        # 1. 动态计算 chunk_size
-        chunk_size = math.ceil(L_orig / self.n_chunks)
-        overlap = int(chunk_size * self.chunk_overlap_ratio)
+        # 1. 嵌入
+        h = self.embed(x, x_coord)                      # (B, L_orig, d)
+
+        # 2. 滑窗切分
+        chunk_size = self.chunk_size
+        overlap = self.chunk_overlap
         step = chunk_size - overlap
+        n_chunks = math.ceil((L_orig - overlap) / step)
 
-        # 2. 补 -1 到能被 step 整除
-        pad_len = (step - L_orig % step) % step
+        # 3. 需要 pad 到能整除 step
+        pad_len = n_chunks * step + overlap - L_orig
         if pad_len > 0:
-            x = F.pad(x, (0, pad_len), value=-1)
-            x_coord = F.pad(x_coord, (0, 0, 0, pad_len), value=0.0)
-        L_pad = x.shape[-1]
+            h = F.pad(h, (0, 0, 0, pad_len))            # (B, L_pad, d)
+        L_pad = h.shape[1]
 
-        # 3. 嵌入
-        h = self.embed(x, x_coord)  # (B, L_pad, d_model)
+        # 4. 收集每个 chunk 的输出，同时记录每个 token 被哪些 chunk 覆盖
+        out_buf = torch.zeros(B, L_pad, h.shape[-1], device=device)
+        count_buf = torch.zeros(B, L_pad, dtype=torch.long, device=device)
 
-        # 4. 滑窗切 chunk -> 独立模块
-        outs = []
-        start = 0
-        for i in range(self.n_chunks):
-            end = min(start + chunk_size, L_pad)
-            chunk = h[:, start:end, :]
-            outs.append(self.chunk_modules[i](chunk))  # (B, chunk_len, d)
-            if end == L_pad:
-                break
-            start += step
+        for i in range(n_chunks):
+            start = i * step
+            end = start + chunk_size
+            chunk = h[:, start:end, :]                  # (B, chunk_size, d)
+            chunk_out = self.chunk_module(chunk)        # (B, chunk_size, d)
 
-        # 5. concat (axis=-2) -> 投影回原始长度
-        h_seq = torch.cat(outs, dim=-2)  # (B, total_len, d)
-        h_seq = self.length_proj(h_seq.transpose(1, 2))  # (B, d, total_len)
-        h_seq = F.interpolate(h_seq, size=L_orig, mode='linear', align_corners=False)  # (B, d, L_orig)
+            # 累加重叠区域
+            out_buf[:, start:end, :] += chunk_out
+            count_buf[:, start:end] += 1
 
-        # 6. 输出 logits
-        logits = self.out_conv(h_seq).transpose(1, 2)  # (B, L_orig, n_cats)
+        # 5. 重叠区域取平均
+        out_buf = out_buf / count_buf.unsqueeze(-1).clamp_min(1)
+
+        # 6. 1D 卷积 + 插值回原始长度
+        out = self.length_proj(out_buf.transpose(1, 2))  # (B, d, L_pad)
+        out = F.interpolate(out, size=L_orig, mode='linear', align_corners=False)
+
+        # 7. 输出 logits
+        logits = self.out_conv(out).transpose(1, 2)      # (B, L_orig, n_cats)
         return logits
+
 
 # unit test
 if __name__ == "__main__":
-    model = EvoFill(n_cats=4, n_chunks=4, d_model=256, n_layers=4,
-                    chunk_size=512, chunk_overlap_ratio=0.1,
-                    d_state=128, expand=2).cuda()
+    model = EvoFill(
+        n_cats=2,
+        chunk_size=512,
+        chunk_overlap=64,
+        d_model=256,
+        n_layers=4,
+        d_state=128,
+        expand=2,
+    ).cuda()
 
-    x       = torch.randint(-1, 4, (2, 1800)).cuda()
+    x = torch.randint(-1, 4, (2, 1800)).cuda()
     x_coord = torch.randn(1800, 4).cuda()
-    logits  = model(x, x_coord)  # (2, 4*512, 4)
+    logits = model(x, x_coord)
+    print(logits.shape)  # torch.Size([2, 1800, 4])

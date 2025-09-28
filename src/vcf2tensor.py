@@ -51,7 +51,7 @@ def read_vcf(path: str, phased: bool, genome_json: str):
     samples = list(vcf.samples)
 
     gts_list = []
-    var_index_list = []
+    var_depth_list = []
     quat_list = []
 
     total = sum(1 for _ in VCF(path))
@@ -62,17 +62,15 @@ def read_vcf(path: str, phased: bool, genome_json: str):
         row = []
         for gt_str in var.gt_bases:
             if gt_str in ['.|.', './.']:
-                row.append(-1)
+                row.append([-1,-1])
             else:
                 sep = '|' if phased else '/'
-                a1, a2 = gt_str.split(sep)
-                row.append(allele2idx[a1] + allele2idx[a2])
+                for a in gt_str.split(sep):
+                    row.append(allele2idx[a])
         row = np.array(row, dtype=np.int32)
         gts_list.append(row)
-
-        # 离散值个数
-        observed = row[row >= 0]
-        var_index_list.append(int(np.unique(observed).size))
+        
+        var_depth_list.append(int(len(alleles)))
 
         # 变异位点位置坐标
         quat = build_quaternion(var.CHROM, var.POS, chrom_len, chrom_start, genome_len)
@@ -80,10 +78,10 @@ def read_vcf(path: str, phased: bool, genome_json: str):
 
     gts = np.vstack(gts_list).T.astype(np.int32)
     flat = gts[gts >= 0]
-    global_depth = int(flat.max()) + 2
+    global_depth = int(flat.max())
 
     gts = torch.tensor(gts, dtype=torch.int8)
-    var_depth_index = torch.tensor(var_index_list, dtype=torch.int8)
+    var_depth_index = torch.tensor(var_depth_list, dtype=torch.int8)
     quat_tensor = torch.tensor(quat_list, dtype=torch.float32)
 
     return gts, samples, var_depth_index, global_depth, quat_tensor

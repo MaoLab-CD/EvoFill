@@ -97,7 +97,7 @@ class ImputationLoss(nn.Module):
         r2 = torch.where(mask, 0.0, r2)
         return r2
 
-    # ---------- R2 loss（改为 1/log(r2)） ---------- #
+    # ---------- R2 loss（改为 10/log(r2)） ---------- #
     def _r2_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor, mask_valid: torch.Tensor):
         B, V, C = y_pred.shape
         G = self.group_size
@@ -130,7 +130,7 @@ class ImputationLoss(nn.Module):
         if rem:
             r2_penalty += one_group(slice(num_full * G, B))
 
-        return 1.0 / torch.log(r2_penalty + self.eps)
+        return 10.0 / torch.log(r2_penalty + self.eps)
 
     # ---------- 前向 ---------- #
     def forward(self, y_pred, y_true):
@@ -149,9 +149,9 @@ class ImputationLoss(nn.Module):
 
         # 3. GradNorm 或固定系数
         if self.use_gn:
-            losses = torch.stack([ce, 10*r2])
+            losses = torch.stack([ce, r2])
             gn_loss = self.gn_loss(losses)
             # print('ce:',ce,'r2:',r2, 'gn_loss:', gn_loss)
             return gn_loss
         else:
-            return ce + 10 * r2
+            return ce + r2
