@@ -2,8 +2,8 @@
   "data": {
     "genome_json": "/home/qmtang/mnt_qmtang/EvoFill/config/h38_coords.json",
     "path": "data/sim_s2_250901",
-    "train_vcf"   : "data/sim_s2_250901/YRI_CEU_chr22.vcf.gz",
-    "val_vcf"   : "data/sim_s2_250901/CHB_chr22.bgzf.vcf.gz",
+    "train_vcf"   : "/home/qmtang/mnt_qmtang/EvoFill/data/sim_s2_250901/YRI_CEU_chr22.vcf.gz",
+    "val_vcf"   : "/home/qmtang/mnt_qmtang/EvoFill/data/sim_s2_250901/CHB_chr22.bgzf.vcf.gz",
     "tihp": "True"
   },
   "model": {
@@ -11,18 +11,28 @@
     "chunk_size": 8192,
     "chunk_overlap": 128,
     "d_model": 256,
-    "n_layers": 4,
+    "n_layers": 1,
     "d_state": 128,
     "expand": 2
+  },
+  "model_transformer": {
+    "n_cats": 3,
+    "chunk_size": 2048,
+    "chunk_overlap": 128,
+    "d_model": 256,
+    "n_layers": 1,
+    "nhead":8,
+    "dim_feedforward":1024,
+    "dropout":0.1
   },
   "train": {
     "seed": 3407,
     "batch_size": 12,
-    "lr": 1e-5,
+    "lr": 0.0001,
     "weight_decay": 0.01,
     "num_epochs": 1000,
     "mask_ratio": 0.5,
-    "patience" : 10,
+    "patience" : 5,
     "min_delta": 0.001,
     "use_r2_loss": "True",
     "use_grad_norm": "Fasle",

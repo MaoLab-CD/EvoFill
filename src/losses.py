@@ -75,6 +75,33 @@ class GradNormLoss(nn.Module):
             new_w = new_w * (self.num_tasks / new_w.sum())
             self.w.data = new_w  # ✅ 替换 copy_
 
+class DiceLoss(nn.Module):
+    def __init__(self, n_classes, softmax=True):
+        super().__init__()
+        self.n_classes = n_classes
+        self.softmax = softmax
+
+    def forward(self, logits, target):
+        """
+        logits: (B, L, C)
+        target: (B, L)  0..C-1
+        """
+        # 1. 概率
+        if self.softmax:
+            probs = F.softmax(logits, dim=-1)        # (B, L, C)
+        else:
+            probs = logits
+
+        # 2. one-hot  (B, L, C)
+        target_onehot = F.one_hot(target.long(), self.n_classes).float()
+
+        # 3. 按类别求和 → (C,)
+        intersection = (probs * target_onehot).sum(dim=(0, 1))
+        cardinality  = (probs + target_onehot).sum(dim=(0, 1))
+
+        # 4. dice 分数 (C,)  → 1 - 平均 dice
+        dice = (2. * intersection + 1e-8) / (cardinality + 1e-8)
+        return 1. - dice.mean()
 
 class ImputationLoss(nn.Module):
     def __init__(self, use_r2_loss=True, group_size=4, eps=1e-8,
@@ -134,6 +161,7 @@ class ImputationLoss(nn.Module):
 
     # ---------- 前向 ---------- #
     def forward(self, y_pred, y_true):
+        #print("y_true min:", y_true.min().item(), "max:", y_true.max().item(), "C:", y_pred.size(-1))
         mask_valid = (y_true != -1)
         y_true_m   = y_true.clone()
         y_true_m[~mask_valid] = 0
@@ -148,10 +176,11 @@ class ImputationLoss(nn.Module):
             r2 = self._r2_loss(y_pred, y_true, mask_valid)
 
         # 3. GradNorm 或固定系数
+        # print('ce:',ce,'r2:',r2)
         if self.use_gn:
             losses = torch.stack([ce, r2])
             gn_loss = self.gn_loss(losses)
-            # print('ce:',ce,'r2:',r2, 'gn_loss:', gn_loss)
             return gn_loss
         else:
-            return ce + r2
+            # return ce + r2
+            return r2

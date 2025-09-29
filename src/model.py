@@ -133,11 +133,7 @@ class EvoFill(nn.Module):
         # 只实例化一个 ChunkModule，所有 chunk 共享权重
         self.chunk_module = ChunkModule(d_model, n_layers, **mamba_kwargs)
 
-        self.length_proj = nn.Sequential(
-            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1),
-            nn.GELU(),
-        )
-        self.out_conv = nn.Conv1d(d_model, n_cats, kernel_size=1)
+        self.out_proj = nn.Linear(d_model, n_cats)
 
     def forward(self, x: torch.Tensor, x_coord: torch.Tensor):
         """
@@ -180,13 +176,11 @@ class EvoFill(nn.Module):
         # 5. 重叠区域取平均
         out_buf = out_buf / count_buf.unsqueeze(-1).clamp_min(1)
 
-        # 6. 1D 卷积 + 插值回原始长度
-        out = self.length_proj(out_buf.transpose(1, 2))  # (B, d, L_pad)
-        out = F.interpolate(out, size=L_orig, mode='linear', align_corners=False)
-
-        # 7. 输出 logits
-        logits = self.out_conv(out).transpose(1, 2)      # (B, L_orig, n_cats)
-        return logits
+        out_buf = out_buf / count_buf.unsqueeze(-1).clamp_min(1).float()
+        out_buf = out_buf[:, :L_orig, :]              # (B, L_orig, d_model)
+        logits = self.out_proj(out_buf)               # (B, L_orig, n_cats)
+        probs = logits.softmax(dim=-1)                # 保证每位点 n_cats 和为 1
+        return probs
 
 
 # unit test
@@ -201,7 +195,7 @@ if __name__ == "__main__":
         expand=2,
     ).cuda()
 
-    x = torch.randint(-1, 4, (2, 1800)).cuda()
+    x = torch.randint(-1, 2, (2, 1800)).cuda()
     x_coord = torch.randn(1800, 4).cuda()
     logits = model(x, x_coord)
     print(logits.shape)  # torch.Size([2, 1800, 4])
