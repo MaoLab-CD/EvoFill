@@ -182,5 +182,5 @@ class ImputationLoss(nn.Module):
             gn_loss = self.gn_loss(losses)
             return gn_loss
         else:
-            # return ce + r2
-            return r2
+            return ce + r2
+            # return r2

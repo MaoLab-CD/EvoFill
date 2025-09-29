@@ -29,7 +29,7 @@ def build_quaternion(chrom, pos, chrom_len_dict, chrom_start_dict, genome_len):
     ]
 
 
-def read_vcf(path: str, phased: bool, genome_json: str):
+def read_vcf(path: str, phased: bool, genome_json: str, global_depth=None):
     """
     返回
         gts: np.ndarray (n_samples, n_snps)  int32
@@ -78,7 +78,11 @@ def read_vcf(path: str, phased: bool, genome_json: str):
 
     gts = np.vstack(gts_list).T.astype(np.int32)
     flat = gts[gts >= 0]
-    global_depth = int(flat.max())
+    if global_depth is None:
+        global_depth = int(flat.max())
+
+    print(f'All missing site set to {global_depth+1}')
+    gts[gts == -1] = global_depth+1
 
     gts = torch.tensor(gts, dtype=torch.int8)
     var_depth_index = torch.tensor(var_depth_list, dtype=torch.int8)
@@ -107,7 +111,7 @@ if __name__ == "__main__":
 
     # ---------- 验证集 ----------
     val_gts, val_samples, _, _, quat_val = read_vcf(
-        cfg.data.val_vcf, phased, genome_json)
+        cfg.data.val_vcf, phased, genome_json, global_depth=global_depth)
 
     torch.save({'gts': val_gts, 'coords':quat_val, 'var_depths':var_depth_index},
                os.path.join(cfg.data.path, "val.pt"))

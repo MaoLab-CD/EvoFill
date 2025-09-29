@@ -24,10 +24,11 @@ from src.model import EvoFill
 from src.losses import ImputationLoss
 
 class GenotypeDataset(Dataset):
-    def __init__(self, gts, coords, mask_ratio=0.0):
+    def __init__(self, gts, coords, global_cats, mask_ratio=0.0):
         self.gt_true = gts.long()          # 原始完整标签
         self.coords = coords.float()
         self.mask_ratio = mask_ratio
+        self.mask_int = global_cats
 
     def __len__(self):
         return self.gt_true.shape[0]
@@ -40,7 +41,7 @@ class GenotypeDataset(Dataset):
         gt_mask = gt_true.clone()
         if self.mask_ratio > 0:
             mask = torch.rand_like(gt_mask.float()) < self.mask_ratio
-            gt_mask[mask] = -1             # 仅输入被遮掩
+            gt_mask[mask] = self.mask_int              # 仅输入被遮掩
 
         # 返回：输入（含缺失）、原始标签、坐标
         return gt_mask, gt_true, coords 
@@ -55,9 +56,9 @@ def collate_fn(batch):
     coords   = batch[0][2]          # 全局共享
     return gt_mask, gt_true, coords
 
-def build_loader(pt_path, batch_size, shuffle, mask_ratio, sampler=None):
+def build_loader(pt_path, batch_size, shuffle, global_cats, mask_ratio, sampler=None):
     data = torch.load(pt_path)
-    dataset = GenotypeDataset(data['gts'], data['coords'], mask_ratio=mask_ratio)
+    dataset = GenotypeDataset(data['gts'], data['coords'], global_cats=global_cats, mask_ratio=mask_ratio)
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -107,7 +108,7 @@ def imputation_balanced_acc(logits, gts, mask):
         score = balanced_accuracy_score(true_vec, pred_vec)
     return torch.tensor(score, device=logits.device, dtype=torch.float32)
 
-def train_epoch(model, loader, criterion, optimizer, device, rank, writer=None, global_step=0):
+def train_epoch(model,cfg, loader, criterion, optimizer, device, rank, writer=None, global_step=0):
     model.train()
     total_loss, total_mask = 0.0, 0
     total_acc, total_f1, total_bacc = 0.0, 0.0, 0.0
@@ -128,7 +129,7 @@ def train_epoch(model, loader, criterion, optimizer, device, rank, writer=None, 
         loss.backward()
         optimizer.step()
 
-        mask = gt_mask == -1
+        mask = gt_mask == cfg.model.n_cats
         acc  = imputation_accuracy(logits, gt_true, mask)
         f1   = imputation_macro_f1(logits, gt_true, mask)
         bacc = imputation_balanced_acc(logits, gt_true, mask)
@@ -163,7 +164,7 @@ def train_epoch(model, loader, criterion, optimizer, device, rank, writer=None, 
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, rank):
+def validate(model, cfg, loader, criterion, device, rank):
     model.eval()
     total_loss, total_mask = 0.0, 0
     total_acc, total_f1, total_bacc = 0.0, 0.0, 0.0
@@ -172,7 +173,7 @@ def validate(model, loader, criterion, device, rank):
         gt_mask, gt_true, coords = gt_mask.to(device), gt_true.to(device), coords.to(device)
         logits = model(gt_mask, coords)
         loss = criterion(logits, gt_true)
-        mask = gt_mask == -1
+        mask = gt_mask == cfg.model.n_cats
         acc  = imputation_accuracy(logits, gt_true, mask)
         f1   = imputation_macro_f1(logits, gt_true, mask)
         bacc = imputation_balanced_acc(logits, gt_true, mask)
@@ -223,27 +224,11 @@ class EarlyStopper:
 
         return self.counter >= self.patience
 
-def setup_distributed():
-    """
-    如果环境变量里已经有 RANK，说明是 torchrun 拉起，直接返回；
-    否则自己 init 一个单卡的 'dummy' 分布式环境，保证后面代码可以统一写。
-    """
-    if "RANK" in os.environ:          # torchrun 已经设置好
-        rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-    else:                             # 单机单卡 python train.py
-        os.environ["RANK"] = "0"
-        os.environ["LOCAL_RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        rank = local_rank = 0
-        world_size = 1
-        # 用 gloo 后端即可（单卡不需要 nccl）
-        dist.init_process_group(backend="gloo", rank=0, world_size=1)
-    return rank, local_rank, world_size
 
 def main():
-    rank, local_rank, world_size = setup_distributed()
+    rank       = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
     if world_size > 1:          # 只有多卡才需要真正的 NCCL 初始化
         dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(local_rank)
@@ -261,6 +246,7 @@ def main():
     train_sampler = DistributedSampler(
         GenotypeDataset(torch.load(Path(cfg.data.path) / "train.pt")['gts'],
                         torch.load(Path(cfg.data.path) / "train.pt")['coords'],
+                        global_cats = cfg.model.n_cats,
                         mask_ratio=cfg.train.mask_ratio),
         shuffle=True,
     )
@@ -268,6 +254,7 @@ def main():
         Path(cfg.data.path) / "train.pt",
         batch_size=cfg.train.batch_size,
         shuffle=False,  # sampler 控制
+        global_cats = cfg.model.n_cats,
         mask_ratio=cfg.train.mask_ratio,
         sampler=train_sampler,
     )
@@ -275,6 +262,7 @@ def main():
         Path(cfg.data.path) / "val.pt",
         batch_size=cfg.train.batch_size,
         shuffle=False,
+        global_cats = cfg.model.n_cats,
         mask_ratio=cfg.train.mask_ratio,
         sampler=None,
     )
@@ -320,9 +308,9 @@ def main():
     for epoch in range(1, cfg.train.num_epochs + 1):
         train_sampler.set_epoch(epoch)
         train_loss, train_acc, train_bacc, train_f1, global_step = train_epoch(
-            model, train_loader, criterion, optimizer,device, rank,
+            model, cfg, train_loader, criterion, optimizer,device, rank,
             writer=writer, global_step=global_step)
-        val_loss, val_acc, val_bacc, val_f1 = validate(model, val_loader, criterion, device, rank)
+        val_loss, val_acc, val_bacc, val_f1 = validate(model,cfg, val_loader, criterion, device, rank)
 
         scheduler.step(val_loss)
 

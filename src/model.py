@@ -21,7 +21,7 @@ class CatEmbeddings(nn.Module):
 
     def forward(self, x: torch.Tensor, x_coord: torch.Tensor):
         """
-        x:       (B, L)        long，-1 会被当成 padding_idx n_cats
+        x:       (B, L)        long，n_cats 会被当成missing
         x_coord: (L, 4)        float
         return:  (B, L, d_model)
         """
@@ -186,7 +186,7 @@ class EvoFill(nn.Module):
 # unit test
 if __name__ == "__main__":
     model = EvoFill(
-        n_cats=2,
+        n_cats=4,
         chunk_size=512,
         chunk_overlap=64,
         d_model=256,
@@ -195,7 +195,7 @@ if __name__ == "__main__":
         expand=2,
     ).cuda()
 
-    x = torch.randint(-1, 2, (2, 1800)).cuda()
+    x = torch.randint(0, 5, (2, 1800)).cuda()
     x_coord = torch.randn(1800, 4).cuda()
     logits = model(x, x_coord)
     print(logits.shape)  # torch.Size([2, 1800, 4])
