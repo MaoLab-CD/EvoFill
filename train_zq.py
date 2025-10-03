@@ -18,15 +18,13 @@ import random
 from itertools import chain
 from sklearn.metrics import f1_score
 from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
 from torch.optim import AdamW
 from torch_optimizer import Lamb
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from tqdm import tqdm
 from src.utils import load_config
-from src.model import EvoFill
-# from src.model_transformer import EvoFill
+from src.model_zq import EvoFill
 from src.losses import ImputationLoss
 
 MAF_BINS = [(0.00, 0.05), (0.05, 0.10), (0.10, 0.20),
@@ -36,32 +34,17 @@ def unwrap(model):
     """返回真实模型，不管外面包了几层 DDP / FSDP."""
     return model.module if hasattr(model, 'module') else model
 
-def expand_gt_to_one_hot(logits: torch.Tensor, gt_true: torch.Tensor):
+def index2onehot(x_int, n_alleles_real):
     """
-    将 gt_true 从 (B, L) 转换为与 logits 同形状的 one-hot 编码 (B, L, C)。
-
-    Parameters
-    ----------
-    logits : torch.Tensor
-        模型输出，形状 (B, L, C)，任意浮点 dtype。
-    gt_true : torch.Tensor
-        真实标签，形状 (B, L)，元素范围 0~C-1，整数 dtype。
-
-    Returns
-    -------
-    torch.Tensor
-        one-hot 编码，形状 (B, L, C)，与 logits 同设备、同 dtype。
+    x_int: (B, L)  含 -1
+    return (B, L, n_alleles_real+1)  float
     """
-    B, L, C = logits.shape
-    assert gt_true.shape == (B, L), f"gt_true shape {gt_true.shape} != ({B}, {L})"
-
-    # 1. 先转成 one-hot，此时是 (B, L, C) 的 0/1 值，dtype 为 uint8 / int64
-    one_hot = F.one_hot(gt_true, num_classes=C)   # (B, L, C)
-
-    # 2. 把 dtype 和设备对齐到 logits，方便后续计算损失
-    one_hot = one_hot.to(dtype=logits.dtype, device=logits.device)
-
-    return one_hot
+    x = x_int.clone()
+    x[x == -1] = n_alleles_real          # missing -> 最后一个 index
+    B, L = x.shape
+    x_onehot = torch.zeros(B, L, n_alleles_real + 1, dtype=torch.float32, device=x.device)
+    x_onehot.scatter_(2, x.long().unsqueeze(-1), 1)
+    return x_onehot
 
 class GenotypeDataset(Dataset):
     def __init__(self, gts, coords, mask_int = -1, mask_ratio=0.0):
@@ -173,9 +156,17 @@ def train_epoch(model, cfg, loader, criterion, optimizer, device, rank,
     for gt_mask, gt_true, coords in pbar:
         gt_mask, gt_true, coords = gt_mask.to(device), gt_true.to(device), coords.to(device)
 
-        logits = model(gt_mask, coords)
-        gt_true_oh = expand_gt_to_one_hot(logits, gt_true)
-        loss, logs = criterion(logits, gt_true_oh)
+        # logits = model(gt_mask, coords)
+        gt_mask_onehot = index2onehot(gt_mask, cfg.data.n_alleles)
+        logits = model(gt_mask_onehot)        # 新模型只接收 one-hot，coords 已嵌入
+
+        raw_model = unwrap(model)          # 先剥壳
+        shared_params = list(chain(
+            raw_model.embed.norm.parameters(),
+            raw_model.evo_embed.norm.parameters()))
+        loss, logs = criterion(logits, gt_true,
+                            shared_params=shared_params,
+                            retain_graph=True)           # 训练阶段需要
 
         optimizer.zero_grad()
         loss.backward()
@@ -191,8 +182,13 @@ def train_epoch(model, cfg, loader, criterion, optimizer, device, rank,
             writer.add_scalar("Model/lr", lr, global_step)
             writer.add_scalar("Train/Loss", loss.item(), global_step)
             writer.add_scalar("Train/CE", logs['ce'], global_step)
-            writer.add_scalar("Train/KL", logs['kl'], global_step)
+            writer.add_scalar("Train/Focal", logs['focal'], global_step)
             writer.add_scalar("Train/R2", logs['r2'], global_step)
+
+            if criterion.gradnorm is not None:
+                writer.add_scalar('Model/w_focal', criterion.gradnorm.w[0], global_step)
+                if len(criterion.gradnorm.w) > 1:
+                    writer.add_scalar('Model/w_r2', criterion.gradnorm.w[1], global_step)
             global_step += 1
 
     # 2. 训练结束后，统一跑一次 forward（no_grad）收集全部结果
@@ -202,12 +198,15 @@ def train_epoch(model, cfg, loader, criterion, optimizer, device, rank,
         pbar = tqdm(loader, ncols=80, disable=(rank != 0), leave=False, desc='2/3')
         for gt_mask, gt_true, coords in pbar:
             gt_mask, gt_true = gt_mask.to(device), gt_true.to(device)
-            logits = model(gt_mask, coords) 
+
+            # logits = model(gt_mask, coords)
+            gt_mask_onehot = index2onehot(gt_mask, cfg.data.n_alleles)
+            logits = model(gt_mask_onehot)        # 新模型只接收 one-hot，coords 已嵌入
+
             mask = gt_mask == -1
             all_logits.append(logits.cpu())
             all_gts.append(gt_true.cpu())
             all_mask.append(mask.cpu())
-    
     # 拼大矩阵
     all_logits = torch.cat(all_logits, 0)   # (N, L, A)
     all_gts    = torch.cat(all_gts, 0)      # (N, L)
@@ -231,9 +230,12 @@ def validate(model, cfg, loader, criterion, device, rank, global_maf, writer=Non
         pbar = tqdm(loader, ncols=80, disable=(rank != 0), leave=False, desc='3/3')
         for gt_mask, gt_true, coords in pbar:
             gt_mask, gt_true, coords = gt_mask.to(device), gt_true.to(device), coords.to(device)
-            logits = model(gt_mask, coords)
-            gt_true_oh = expand_gt_to_one_hot(logits, gt_true)
-            loss, logs = criterion(logits, gt_true_oh)
+
+            # logits = model(gt_mask, coords)
+            gt_mask_onehot = index2onehot(gt_mask, cfg.data.n_alleles)
+            logits = model(gt_mask_onehot)        # 新模型只接收 one-hot
+
+            loss, logs = criterion(logits, gt_true)
             total_loss += loss.item()
 
             mask = gt_mask == -1
@@ -244,7 +246,7 @@ def validate(model, cfg, loader, criterion, device, rank, global_maf, writer=Non
             if writer:
                 writer.add_scalar("Val/Loss", loss.item(), global_step)
                 writer.add_scalar("Val/CE", logs['ce'], global_step)
-                writer.add_scalar("Val/KL", logs['kl'], global_step)
+                writer.add_scalar("Val/Focal", logs['focal'], global_step)
                 writer.add_scalar("Val/R2", logs['r2'], global_step)
                 global_step += 1
 
@@ -322,6 +324,19 @@ def main():
     if rank == 0:
         print('Train MAF-bin counts:', bin_cnt)
 
+    # train_ds = GenotypeDataset(torch.load(Path(cfg.data.path) / "train.pt")['gts'],
+    #                         torch.load(Path(cfg.data.path) / "train.pt")['coords'],
+    #                         mask_int = -1,
+    #                         mask_ratio=cfg.train.mask_ratio)
+    # train_sampler = WeightedDistributedSampler(
+    #     train_ds,
+    #     maf=global_maf,          # 已预计算
+    #     maf_low=0.05,            # 可调
+    #     alpha=100,               # 可调
+    #     num_replicas=world_size,
+    #     rank=rank,
+    #     shuffle=False            # 父类里我们自己打乱
+    # )
     train_sampler = DistributedSampler(
         GenotypeDataset(torch.load(Path(cfg.data.path) / "train.pt")['gts'],
                         torch.load(Path(cfg.data.path) / "train.pt")['coords'],
@@ -348,6 +363,11 @@ def main():
 
     # 3. 模型 -> DDP
     model = EvoFill(**vars(cfg.model)).to(device)
+    L = train_data['gts'].shape[1]          # 序列长度
+    n_alleles_real = cfg.data.n_alleles     # 配置里只写了真实 allele 数（不含 missing）
+    model.build(seq_len=L, n_alleles=n_alleles_real + 1)   # +1 把 missing 算进去
+    model = model.cuda()
+
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
@@ -361,10 +381,16 @@ def main():
         writer = SummaryWriter(tb_dir)
 
     # 4. 损失 & 优化器
-    criterion = ImputationLoss(use_r2=cfg.train.use_r2_loss).to(device)
+    criterion = ImputationLoss(
+        use_r2=cfg.train.use_r2_loss,
+        use_focal=cfg.train.use_focal,
+        group_size=cfg.train.r2_loss_groupsize,
+        use_gradnorm=cfg.train.use_gradnorm,
+        gn_alpha=cfg.train.gn_alpha,
+        gn_lr_w=cfg.train.gn_lr_w).to(device)
 
-    optimizer = AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
-    # optimizer = Lamb(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+    # optimizer = AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+    optimizer = Lamb(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=cfg.train.scheduler_factor, patience=cfg.train.scheduler_patience, min_lr=cfg.train.min_lr)
 
     # 5. 早停

@@ -1,115 +1,166 @@
+#!/usr/bin/env python3
 # imputation.py
-import os, tempfile, shutil, subprocess
+
 import torch
-import json
-from pathlib import Path
+import pandas as pd
 from tqdm import tqdm
 from cyvcf2 import VCF, Writer
+from pathlib import Path
+
 from src.utils import load_config
 from src.model import EvoFill
-from src.vcf2tensor import build_quaternion
-from src.tensor2vcf import logits2vcf_line
+from train import precompute_maf, imputation_maf_accuracy_epoch
+from src.vcf2tensor import read_vcf
 
-def add_header_lines(in_vcf: Path, work_dir: Path) -> Path:
+
+def load_model(cfg, device):
+    model = EvoFill(**vars(cfg.model)).to(device)
+    ckpt_path = Path(cfg.train.save) / "evofill_best.pt"
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def batch_inference(model, gts, coords, cfg, device, infer_batch=64):
     """
-    返回一个 *完整 VCF*（含记录），其 header 已追加 GT/GP/DS/IMPUTED。
-    依赖 bcftools（默认服务器已有），没有就退化为文本拼接。
+    分段 + 分样本 batch 推理
+    返回: filled_gts (N, L)  ,  mask (N, L)
     """
-    header_txt = [
-        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
-        '##FORMAT=<ID=GP,Number=G,Type=Float,Description="Estimated Posterior Probabilities for Genotypes 0/0, 0/1 and 1/1">',
-        '##FORMAT=<ID=DS,Number=A,Type=Float,Description="Estimated Alternate Allele Dosage : [P(0/1)+2*P(1/1)]">',
-        '##INFO=<ID=IMPUTED,Number=0,Type=Flag,Description="Marker was imputed">'
-    ]
-    hdr_file = work_dir / "extra.hdr"
-    hdr_file.write_text('\n'.join(header_txt) + '\n')
+    N, L = gts.shape
+    chunk_size = cfg.model.chunk_size
+    overlap = cfg.model.chunk_overlap
+    filled = gts.clone()
+    mask = gts == -1
 
-    out_vcf = work_dir / f"{in_vcf.stem}.withHdr.vcf.gz"
-    try:
-        # 1. bcftools reheader 直接生成新文件（最快，且保留压缩）
-        subprocess.check_call(
-            ["bcftools", "reheader", "-h", str(hdr_file), "-o", str(out_vcf), str(in_vcf)],
-            stderr=subprocess.DEVNULL
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        # 2. fallback：文本级拼接（解压→改头→再压缩）
-        tmp_vcf = work_dir / "tmp.vcf"
-        with open(tmp_vcf, 'w') as fo:
-            # 先写新头
-            fo.write(open(hdr_file).read())
-            # 再把原始记录流式拷过来（跳过旧头）
-            with open(in_vcf) as fi:
-                for line in fi:
-                    if line.startswith('#'):
-                        continue
-                    fo.write(line)
-        # 重新压缩索引（可选）
-        subprocess.check_call(["bgzip", "-f", str(tmp_vcf)])
-        shutil.move(str(tmp_vcf) + ".gz", str(out_vcf))
+    # 1. 按位点滑窗
+    for start in tqdm(range(0, L, chunk_size - overlap), desc="chunk"):
+        end = min(start + chunk_size, L)
+        sub_coords = coords[start:end].to(device)          # (sub_L, 4)
+        sub_gts = gts[:, start:end]                        # (N, sub_L)
 
-    return out_vcf
+        # 2. 对该 chunk 再按样本 batch 前向
+        preds_chunk = torch.empty_like(sub_gts)
+        for i in range(0, N, infer_batch):
+            batch_gts = sub_gts[i:i + infer_batch].to(device)
+            logits = model(batch_gts, sub_coords)          # (B, sub_L, A)
+            preds = logits.argmax(-1).cpu()
+            preds_chunk[i:i + infer_batch] = preds
+
+        # 3. 仅更新缺失位点
+        sub_mask = mask[:, start:end]
+        filled[:, start:end][sub_mask] = preds_chunk[sub_mask]
+    return filled, mask
 
 
-cfg   = load_config("config/config.json")
-device= torch.device( cfg.train.device)
-ckpt  = Path(cfg.train.save)/"evofill_best.pt"
-out_vcf = Path(cfg.infer.output_vcf)
+def write_imputed_vcf(in_vcf_path, out_vcf_path, filled_gts, samples):
+    """
+    把填充后的基因型写回 VCF，仅替换原来 ./. 或 .|. 的行
+    """
+    # 先把 VCF 打开一次，取出长度
+    vcf = VCF(in_vcf_path)
+    total_sites = sum(1 for _ in vcf) 
+    vcf.close()
 
-# ---- 0. 临时工作目录 ----
-work_dir = out_vcf.parent / "tmp_impute"
-work_dir.mkdir(exist_ok=True)
+    # 重新打开正式循环，并加进度条
+    vcf = VCF(in_vcf_path)
+    w = Writer(out_vcf_path, tmpl=vcf)
+    n_sample_dip = len(samples) 
+    miss_count = 0
+    for var_idx, var in enumerate(tqdm(vcf, total=total_sites, desc="writing VCF")):
+        gt_arr  = var.genotypes.copy()   # (N, 3)
+        for i in range(n_sample_dip):    # 二倍体样本索引
+            row = gt_arr[i]
+            if row[0] == -1 and row[1] == -1:   # 缺失
+                a1 = filled_gts[2 * i,     var_idx]
+                a2 = filled_gts[2 * i + 1, var_idx]
+                try:
+                    row[0] = a1
+                    row[1] = a2
+                except IndexError:
+                    miss_count += 1
+                    pass
 
-# ---- 1. 模型 ----
-model = EvoFill(**vars(cfg.model)).to(device)
-model.load_state_dict(torch.load(ckpt, map_location=device))
-model.eval()
+        var.genotypes = gt_arr
+    w.write_record(var)
+    print(f"{miss_count} sites fill failed.")
+    w.close()
+    vcf.close()
 
-# ---- 2. 先给输入 VCF 加 header ----
-tmp_vcf = add_header_lines(Path(cfg.infer.input_vcf), work_dir)
 
-# ---- 3. 打开 VCF ----
-vcf_in  = VCF(str(tmp_vcf), gts012=True)
-vcf_out = Writer(str(out_vcf), vcf_in)
-
-# ---- 4. 坐标张量 ----
-gmeta = json.load(open(cfg.data.genome_json))
-
-var_coords, var_idxs = [], []
-for variant in vcf_in:
-    var_coords.append(
-        torch.tensor(build_quaternion(variant.CHROM, variant.POS,
-                                        gmeta['chrom_len'], gmeta['chrom_start'], gmeta['genome_len']))
+def evaluate_with_truth(cfg, imputed_gts, imputed_mask, device):
+    """
+    若提供了 ground-truth VCF，计算 MAF-bin 准确度
+    """
+    gt_gts, _, _, _, _ = read_vcf(
+        cfg.infer.ground_true,
+        phased=bool(cfg.data.tihp),
+        genome_json=cfg.data.genome_json
     )
-    var_idxs.append(len(var_coords)-1)
-var_coords = torch.stack(var_coords)  # (n_var, 4)
+    assert gt_gts.shape == imputed_gts.shape
+    maf, _ = precompute_maf(gt_gts.numpy(), mask_int=-1)
+    A = cfg.model.n_alleles
+    logits = torch.nn.functional.one_hot(imputed_gts.long(), num_classes=A).float()
+    accs = imputation_maf_accuracy_epoch(
+        logits.unsqueeze(0),
+        gt_gts.unsqueeze(0),
+        imputed_mask.unsqueeze(0),
+        maf
+    )
+    bins = ["0-0.05", "0.05-0.1", "0.1-0.2", "0.2-0.3", "0.3-0.4", "0.4-0.5"]
+    bin_edges = [0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
+    site_counts = [
+        ((maf >= bin_edges[i]) & (maf < bin_edges[i+1])).sum().item()
+        for i in range(6)
+    ]
 
-# ---- 5. 分批推理并写回 ----
-batch_size = cfg.infer.batch_size
-n_var = len(var_idxs)
-for start in tqdm(range(0, n_var, batch_size), desc="Imputing"):
-    end  = min(start + batch_size, n_var)
-    idxs = var_idxs[start:end]
-    coords_batch = var_coords[idxs].to(device)
+    # ---- 构造 DataFrame ----
+    df = pd.DataFrame({
+        "MAF_bin":  bins,
+        "n_sites":  site_counts,
+        "accuracy": accs
+    })
 
-    gts_batch = []
-    for i in idxs:
-        gts_batch.append(torch.tensor(vcf_in[i].gt_types, dtype=torch.int8))
-    gts_batch = torch.stack(gts_batch).to(device)
+    csv_path = Path(cfg.infer.impute_vcf).with_suffix(".maf_acc.csv")
+    df.to_csv(csv_path, index=False)
+    print("MAF-bin accuracy:")
+    print(df)
+    return df
 
-    with torch.no_grad():
-        logits = model(gts_batch, coords_batch)  # (B, nsamp, n_cats)
 
-    for b, i in enumerate(idxs):
-        var  = vcf_in[i]
-        line = logits2vcf_line(var, logits[b], len(vcf_in.samples))
-        var.set_format('GT', line['GT'])
-        var.set_format('GP', line['GP'])
-        var.set_format('DS', line['DS'])
-        if line['IMPUTED']:
-            var.INFO['IMPUTED'] = True
-        vcf_out.write_record(var)
+def main():
+    cfg = load_config("config/config.json")
+    device = torch.device("cuda")
 
-vcf_out.close(); vcf_in.close()
-# 可选：删除临时文件
-shutil.rmtree(work_dir, ignore_errors=True)
-print(f"[IMPUTED] {out_vcf}")
+    # 1. 加载模型
+    model = load_model(cfg, device)
+
+    # 2. 读取待填充 VCF
+    print("Reading input VCF …")
+    gts, samples, _, _, coords = read_vcf(
+        cfg.infer.input_vcf,
+        phased=bool(cfg.data.tihp),
+        genome_json=cfg.data.genome_json
+    )
+    print(f"gts shape: {gts.shape}, coords shape: {coords.shape}")
+
+    # 3. 分段 + 分样本 batch 推理
+    infer_batch = cfg.infer.batch_size
+    filled, mask = batch_inference(model, gts, coords, cfg, device, infer_batch)
+
+    # 4. 写回 VCF
+    print("Writing imputed VCF …")
+    write_imputed_vcf(cfg.infer.input_vcf, cfg.infer.impute_vcf, filled, samples)
+    print(f"Saved: {cfg.infer.impute_vcf}")
+
+    # 5. 若有真值，则评估
+    if Path(cfg.infer.ground_true).exists():
+        print("Evaluating against ground truth …")
+        evaluate_with_truth(cfg, filled, mask, device)
+    else:
+        print("No ground truth provided, skip evaluation.")
+
+
+if __name__ == "__main__":
+    main()

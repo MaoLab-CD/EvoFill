@@ -62,11 +62,16 @@ def read_vcf(path: str, phased: bool, genome_json: str, global_depth=None):
         row = []
         for gt_str in var.gt_bases:
             if gt_str in ['.|.', './.']:
-                row.append([-1,-1])
+                row.extend([-1, -1])
             else:
                 sep = '|' if phased else '/'
-                for a in gt_str.split(sep):
-                    row.append(allele2idx[a])
+                alts = gt_str.split(sep)
+                if len(alts) == 2:
+                    row.extend([allele2idx[a] for a in alts])
+                elif len(alts) == 1:          # 单倍体，补缺失
+                    row.extend([allele2idx[alts[0]], -1])
+                else:                         # 意外情况，全缺失
+                    row.extend([-1, -1])
         row = np.array(row, dtype=np.int32)
         gts_list.append(row)
         
@@ -81,10 +86,12 @@ def read_vcf(path: str, phased: bool, genome_json: str, global_depth=None):
     if global_depth is None:
         global_depth = int(flat.max())
 
-    print(f'All missing site set to {global_depth+1}')
-    gts[gts == -1] = global_depth+1
+    # print(f'All missing site set to {global_depth+1}')
+    # gts[gts == -1] = global_depth+1
 
-    gts = torch.tensor(gts, dtype=torch.int8)
+    gts = torch.tensor(gts, dtype=torch.long)
+    # gts_onehot = torch.nn.functional.one_hot(gts, num_classes=global_depth+2)
+
     var_depth_index = torch.tensor(var_depth_list, dtype=torch.int8)
     quat_tensor = torch.tensor(quat_list, dtype=torch.float32)
 
@@ -101,7 +108,7 @@ if __name__ == "__main__":
     # ---------- 训练集 ----------
     train_gts, train_samples, var_depth_index, global_depth, quat_train = read_vcf(
         cfg.data.train_vcf, phased, genome_json)
-    print(f"Inferred unified depth = {global_depth}")
+    print(f"Inferred unified depth: {list(range(global_depth + 1))}")
 
     torch.save({'gts': train_gts, 'coords':quat_train, 'var_depths':var_depth_index},
                os.path.join(cfg.data.path, "train.pt"))
