@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 # --------------------- 需要改的地方 ---------------------
-LOG_PATH = '/home/qmtang/mnt_qmtang/EvoFill/logs/251004.logs'          # 日志路径
+LOG_PATH = '/home/qmtang/mnt_qmtang/EvoFill/logs/251005.logs'          # 日志路径
 OUT_PATH = None                 # 输出 csv 路径，None 则自动生成
 # ------------------------------------------------------
 
