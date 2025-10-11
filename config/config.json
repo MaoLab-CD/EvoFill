@@ -1,7 +1,7 @@
 {
   "data": {
     "genome_json": "/home/qmtang/mnt_qmtang/EvoFill/config/h38_coords.json",
-    "path": "data/sim_s2_250901",
+    "path": "data/sim_s2_251011",
     "train_vcf"   : "/home/qmtang/mnt_qmtang/EvoFill/data/sim_s2_250901/YRI_CEU_chr22.vcf.gz",
     "val_vcf"   : "/home/qmtang/mnt_qmtang/EvoFill/data/sim_s2_250901/CHB_chr22.bgzf.vcf.gz",
     "tihp": "True",

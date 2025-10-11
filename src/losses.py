@@ -318,7 +318,15 @@ from torch.autograd import grad
 class ImputationLoss(nn.Module):
     """Custom loss function for genomic imputation"""
 
-    def __init__(self, use_r2=True):
+    def __init__(self, use_r2=True, 
+                 use_focal=False, #  all dummy 
+                 group_size=None,
+                 gamma=None,
+                 alpha=None,
+                 eps=None,
+                 use_gradnorm=None,
+                 gn_alpha=None,
+                 gn_lr_w=None,):
         super().__init__()
         self.use_r2_loss = use_r2
         self.ce_loss = nn.CrossEntropyLoss(reduction='sum')
@@ -345,6 +353,7 @@ class ImputationLoss(nn.Module):
         ce_loss = self.ce_loss(y_pred.view(-1, y_pred.size(-1)), y_true_ce.view(-1))
         kl_loss = self.kl_loss(y_pred_log.view(-1, y_pred.size(-1)),
                                y_true.view(-1, y_true.size(-1)))
+
         total_loss = ce_loss + kl_loss
 
         if self.use_r2_loss:
@@ -370,10 +379,7 @@ class ImputationLoss(nn.Module):
 
                 total_loss += r2_loss
 
-        logs = {'ce': ce_loss.detach(),
-                'kl': kl_loss.detach(),
-                'r2': r2_loss.detach() if self.use_r2_loss else 0}
-        return total_loss, logs
+        return total_loss
 
 if __name__ == "__main__":
     B, L = 12, 1000

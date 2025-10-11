@@ -1,351 +1,427 @@
 # model.py
-import math
 import torch
 import torch.nn as nn
-from typing import Optional
 import torch.nn.functional as F
-from mamba_ssm import Mamba2  # 官方实现
+from mamba_ssm import Mamba2
+from mamba_ssm.modules.mamba2_simple import Mamba2Simple as Mamba2Block # 原Mamba2Block
 
 
-class GenoEmbedding(nn.Module):
-    def __init__(self, n_alleles: int, d_model: int, coord_dim: int = 4):
+class BiMambaBlock(nn.Module):
+    """Bidirectional Mamba block for genomic sequence processing"""
+
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
         super().__init__()
-        self.n_alleles = n_alleles
-        # 1. 基础嵌入
-        self.allele_embedding = nn.Embedding(n_alleles + 1, d_model)  # 含缺失行
-        self.coord_proj = nn.Linear(coord_dim, d_model)
+        self.d_model = d_model
 
-        # 2. 低秩双线性（factorized bilinear）
-        self.bilinear_l = nn.Linear(d_model, d_model, bias=False)  # W1
-        self.bilinear_r = nn.Linear(d_model, d_model, bias=False)  # W2
-        self.bilinear_out = nn.Linear(d_model, d_model)            # 降维 + 残差
-        self.norm = nn.LayerNorm(d_model)
+        # Forward and backward Mamba blocks
+        self.mamba_forward = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
+        )
 
-    def forward(self, x: torch.Tensor, x_coord: torch.Tensor):
-        """
-        x:       (B, L)          整型 {-1,0,...,n-1}
-        x_coord: (L, 4)          float  共享坐标
-        """
-        # --- 1. 基础嵌入 ---
-        x = x.clone()
-        x[x == -1] = self.n_alleles
-        e1 = self.allele_embedding(x)            # (B,L,d)
-        e2 = self.coord_proj(x_coord)            # (L,d)
-        e2 = e2.unsqueeze(0)                     # (1,L,d)
+        self.mamba_backward = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
+        )
 
-        # --- 2. 逐位双线性融合 ---
-        l = self.bilinear_l(e1)                  # (B,L,d)
-        r = self.bilinear_r(e2)                  # (1,L,d)
-        z = l * r                                # 逐位乘 → (B,L,d)  二阶交互
-        z = self.bilinear_out(z)                 # 线性降回 d
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
 
-        # --- 3. 残差 + Norm ---
-        out = self.norm(z + e1 + e2)             # 双残差，平滑训练
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model),
+            nn.GELU()
+        )
+
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        # x shape: (batch, seq_len, d_model)
+        residual = x
+
+        # Bidirectional processing
+        x_norm = self.norm1(x)
+
+        # Forward direction
+        forward_out = self.mamba_forward(x_norm)
+
+        # Backward direction (flip sequence)
+        x_backward = torch.flip(x_norm, dims=[1])
+        backward_out = self.mamba_backward(x_backward)
+        backward_out = torch.flip(backward_out, dims=[1])
+
+        # Concatenate bidirectional outputs
+        bi_out = torch.cat([forward_out, backward_out], dim=-1)
+
+        # FFN
+        ffn_out = self.ffn(bi_out)
+        ffn_out = self.dropout(ffn_out)
+
+        # Residual connection
+        out = self.norm2(residual + ffn_out)
+
         return out
 
+class ConvBlock(nn.Module):
+    """Convolutional block for local pattern extraction"""
 
-class EvoEmbedding(nn.Module):
-    """
-    以样本为 token 做交叉注意力，捕捉“样本×样本”的演化关系。
-    输入：
-        x:  (B, L, d)  已融合位点+坐标信息的表示
-        dist: (B, B) 或 None  样本间距离矩阵，作为注意力偏置
-    输出：
-        (B, L, d)  与输入同形状，可残差连接
-    """
-    def __init__(self, d_model: int, n_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, d_model):
         super().__init__()
-        self.n_heads = n_heads
-        self.d_head  = d_model // n_heads
-        assert self.d_head * n_heads == d_model
+        self.d_model = d_model
 
-        # 交叉注意力：Q 来自自身，K/V 来自整个 batch
-        self.q = nn.Linear(d_model, d_model, bias=False)
-        self.k = nn.Linear(d_model, d_model, bias=False)
-        self.v = nn.Linear(d_model, d_model, bias=False)
-        self.o = nn.Linear(d_model, d_model)
+        self.conv1 = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(d_model, d_model, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(d_model, d_model, kernel_size=7, padding=3)
+
+        self.conv_large1 = nn.Conv1d(d_model, d_model, kernel_size=7, padding=3)
+        self.conv_large2 = nn.Conv1d(d_model, d_model, kernel_size=15, padding=7)
+
+        self.conv_final = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
+        self.conv_reduce = nn.Conv1d(d_model, d_model, kernel_size=1)
+
+        self.bn1 = nn.BatchNorm1d(d_model)
+        self.bn2 = nn.BatchNorm1d(d_model)
+
+        self.gelu = nn.GELU()
+
+    def forward(self, x):
+        # x shape: (batch, seq_len, d_model)
+        x = x.transpose(1, 2)  # (batch, d_model, seq_len)
+
+        xa = self.gelu(self.conv1(x))
+
+        xb = self.gelu(self.conv2(xa))
+        xb = self.gelu(self.conv3(xb))
+
+        xc = self.gelu(self.conv_large1(xa))
+        xc = self.gelu(self.conv_large2(xc))
+
+        xa = xb + xc
+        xa = self.gelu(self.conv_final(xa))
+        xa = self.bn1(xa)
+        xa = self.gelu(self.conv_reduce(xa))
+        xa = self.bn2(xa)
+        xa = self.gelu(xa)
+
+        return xa.transpose(1, 2)  # (batch, seq_len, d_model)
+
+class DistanceEmbed(nn.Module):
+    """
+    把 (B,B) 距离矩阵 -> (B, L*, D) 的时序表征
+    L* = 1 或 L，这里用 1 个 token 代表整张图，可扩展
+    """
+    def __init__(self, max_len=1, d_model=256, dropout=0.0):
+        super().__init__()
+        self.max_len = max_len
+        self.embed = nn.Linear(1, d_model)   # 把标量距离映成向量
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor,
-                dist: torch.Tensor | None = None):
+    def forward(self, x_dismat):
         """
-        x:    (B, L, d)
-        dist: (B, B)  距离矩阵，无则填 None
+        x_dismat: (B,B)  对角=0
+        返回: (B, max_len, D)  这里 max_len=1
         """
-        B, L, d = x.shape
-        h = x.mean(dim=1)          # 简单 pooling 成样本级向量 (B,d)
-        h = self.norm(h)
+        # 取均值池化后作为全局距离向量 → 也可换成 GCN/Transformer 做更复杂编码
+        z = x_dismat.mean(dim=1, keepdim=True)            # (B,1)
+        z = z.unsqueeze(1)                         # (B,1,1)
+        z = self.embed(z)                          # (B,1,D)
+        z = self.norm(z)
+        z = self.dropout(z)
+        return z
 
-        # 交叉注意力：以每个样本为 query，整个 batch 为 key/value
-        q = self.q(h).view(B, self.n_heads, self.d_head)   # (B,H,dH)
-        k = self.k(h).view(B, self.n_heads, self.d_head)   # (B,H,dH)
-        v = self.v(h).view(B, self.n_heads, self.d_head)
-
-        # (H,B,B)
-        scores = torch.einsum("bhd,chd->hbc", q, k) / (self.d_head ** 0.5)
-
-        # 距离偏置
-        if dist is not None:
-            # 将 dist 归一化到 0~1 并取反（越近权重越大）
-            bias = 1. - (dist / (dist.max() + 1e-6))
-            bias = bias.unsqueeze(0).expand(self.n_heads, -1, -1)
-            scores = scores + bias
-
-        attn = F.softmax(scores, dim=-1)          # (H,B,B)
-        attn = self.dropout(attn)
-
-        # 加权求和
-        out = torch.einsum("hbc,chd->bhd", attn, v)  # (B,H,dH)
-        out = out.reshape(B, d)
-        out = self.o(out)                           # (B,d)
-
-        # 广播回 L 个位点，残差连接
-        out = out.unsqueeze(1).expand(-1, L, -1)    # (B,L,d)
-        return x + out
-
-
-class BiMamba2Block(nn.Module):
+class Mamba2CrossBlock(nn.Module):
     def __init__(
         self,
-        d_model: int,
-        bidirectional: bool = True,
-        bidirectional_strategy: str = "add",      # "add" | "ew_multiply"
-        bidirectional_weight_tie: bool = True,
-        # ---- 以下透传给 Mamba2 ----
-        d_state: int = 128,
-        expand: int = 2,
-        d_conv: int = 4,
-        conv_bias: bool = True,
-        bias: bool = False,
-        headdim: int = 64,
-        ngroups: int = 1,
-        **mamba2_kwargs,
+        d_model,
+        d_state=64,
+        d_conv=4,
+        expand=2,
+        headdim=128,
+        ngroups=1,
+        chunk_size=256,
+        dropout=0.0,
+        d_embed_dropout=0.0,
+        device=None,
+        dtype=None,
     ):
         super().__init__()
-        if bidirectional and bidirectional_strategy not in {"add", "ew_multiply"}:
-            raise NotImplementedError(bidirectional_strategy)
+        self.d_model = d_model
 
-        self.bidirectional = bidirectional
-        self.strategy = bidirectional_strategy
+        # 距离矩阵嵌入
+        self.dist_embed = DistanceEmbed(max_len=1, d_model=d_model, dropout=d_embed_dropout)
 
-        # 前向 SSM
-        self.mamba_fwd = Mamba2(
+        # 原归一化
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        # SSD 核心
+        self.ssd = Mamba2Block(
             d_model=d_model,
             d_state=d_state,
-            expand=expand,
             d_conv=d_conv,
-            conv_bias=conv_bias,
-            bias=bias,
+            expand=expand,
             headdim=headdim,
             ngroups=ngroups,
-            **mamba2_kwargs,
+            chunk_size=chunk_size,
+            use_mem_eff_path=True,
+            device=device,
+            dtype=dtype,
         )
 
-        if bidirectional:
-            self.mamba_rev = Mamba2(
-                d_model=d_model,
-                d_state=d_state,
-                expand=expand,
-                d_conv=d_conv,
-                conv_bias=conv_bias,
-                bias=bias,
-                headdim=headdim,
-                ngroups=ngroups,
-                **mamba2_kwargs,
-            )
-            if bidirectional_weight_tie:
-                self.mamba_rev.in_proj.weight = self.mamba_fwd.in_proj.weight
-                self.mamba_rev.in_proj.bias   = self.mamba_fwd.in_proj.bias
-                self.mamba_rev.out_proj.weight = self.mamba_fwd.out_proj.weight
-                self.mamba_rev.out_proj.bias   = self.mamba_fwd.out_proj.bias
-        else:
-            self.mamba_rev = None
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model),
+        )
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        out = self.mamba_fwd(x)
-        if self.bidirectional:
-            x_rev = x.flip(dims=[1])
-            out_rev = self.mamba_rev(x_rev).flip(dims=[1])
-            if self.strategy == "add":
-                out = out + out_rev
-            elif self.strategy == "ew_multiply":
-                out = out * out_rev
-            else:
-                raise RuntimeError(self.strategy)
-        return out
+    def forward(self, local_repr, global_repr,
+                start_offset=0, end_offset=0,
+                x_dismat=None):
+        """
+        local_repr: (B, L, D)
+        global_repr: (B, G, D)
+        D: 可选，(B,B) 距离矩阵，对角=0
+        """
+        local_norm  = self.norm1(local_repr)
+        global_norm = self.norm2(global_repr)
 
+        # 1. 构造输入序列
+        tokens = []
+        if x_dismat is not None:
+            dist_token = self.dist_embed(self.d_model)        # (B,1,D)
+            tokens.append(dist_token)
+        tokens.append(global_norm)
+        tokens.append(local_norm)
+        x = torch.cat(tokens, dim=1)               # [B, (1)+G+L, D]
+
+        # 2. SSD 扫描
+        x = self.ssd(x)                            # [B, (1)+G+L, D]
+
+        # 3. 只取 local 部分
+        local_len = local_norm.shape[1]
+        x = x[:, -local_len:, :]                   # [B, L, D]
+
+        # 4. pad 回原始长度
+        if start_offset or end_offset:
+            x = F.pad(x, (0, 0, start_offset, end_offset))
+
+        # 5. 残差 + FFN
+        x = x + local_norm
+        x = self.norm3(x)
+        x = self.ffn(x) + x
+        return x
+
+class GenoEmbedding(nn.Module):
+    """
+    兼容 one-hot 输入的基因组嵌入层
+    位置信息由 4 元浮点坐标实时生成
+    """
+    def __init__(self, n_alleles: int, d_model: int, coord_dim: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        # 1. allele 嵌入：one-hot → d_model
+        self.allele_embedding = nn.Parameter(torch.empty(n_alleles, d_model))
+        nn.init.xavier_uniform_(self.allele_embedding)
+
+        # 2. 坐标→位置向量网络
+        self.coord_proj = nn.Sequential(
+            nn.Linear(coord_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model)
+        )
+
+    def forward(self, x: torch.Tensor, x_coord: torch.Tensor):
+        """
+        x:       (B, L, n_alleles)  one-hot 浮点
+        x_coord: (L, 4)            每个 SNP 的 4 元坐标
+        return:  (B, L, d_model)
+        """
+        # 1. allele 嵌入
+        allele_emb = torch.einsum('bln,nd->bld', x, self.allele_embedding)  # (B,L,d)
+
+        # 2. 坐标嵌入
+        pos_emb = self.coord_proj(x_coord)           # (L,d)
+        pos_emb = pos_emb.unsqueeze(0)               # (1,L,d)
+
+        return allele_emb + pos_emb
 
 class ChunkModule(nn.Module):
-    def __init__(self, d_model: int, n_layers: int, **mamba_kwargs):
-        super().__init__()
-        self.blocks = nn.ModuleList([
-            BiMamba2Block(d_model=d_model, **mamba_kwargs)
-            for _ in range(n_layers)
-        ])
+    """Single chunk processing module with BiMamba"""
 
-    def forward(self, x_chunk):
-        for blk in self.blocks:
-            x_chunk = blk(x_chunk)
-        return x_chunk
+    def __init__(self, d_model, start_offset=0, end_offset=0, dropout_rate=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.start_offset = start_offset
+        self.end_offset = end_offset
+
+        # BiMamba block
+        self.bimamba_block = BiMambaBlock(d_model)
+
+        # Convolutional blocks
+        self.conv_block1 = ConvBlock(d_model)
+        self.conv_block2 = ConvBlock(d_model)
+        self.conv_block3 = ConvBlock(d_model)
+
+        # Cross attention
+        # self.cross_attention = CrossAttentionLayer(d_model, n_heads)
+        self.cross_attention = Mamba2CrossBlock(
+            d_model=d_model,
+            d_state=64,
+            d_conv=4,
+            expand=2,
+            headdim=128,
+            ngroups=1,
+            chunk_size=256,
+        )
+
+        # Additional layers
+        self.dense = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.gelu = nn.GELU()
+
+    def forward(self, x, x_dismat=None):
+        # BiMamba processing
+        xa0 = self.bimamba_block(x)
+
+        # First conv block
+        xa = self.conv_block1(xa0)
+        xa_skip = self.conv_block2(xa)
+
+        # Dense layer
+        xa = self.gelu(self.dense(xa))
+        xa = self.conv_block2(xa)
+
+        # Cross attention
+        xa = self.cross_attention(xa, xa0, self.start_offset, self.end_offset, x_dismat)
+        xa = self.dropout(xa)
+
+        # Final conv block
+        xa = self.conv_block3(xa)
+
+        # Concatenate with skip connection
+        xa = torch.cat([xa_skip, xa], dim=-1)
+
+        return xa
 
 class EvoFill(nn.Module):
-    def __init__(
-        self,
-        n_alleles: int,          # 真实 allele 类别数（不含缺失）
-        chunk_size: int,
-        d_model: int = 256,
-        n_evo_heads: int = 8,
-        n_layers: int = 4,
-        chunk_overlap: int = 64,
-        **mamba_kwargs,
-    ):
+    def __init__(self,
+                 d_model,
+                 n_alleles,
+                 coord_dim = 4,
+                 chunk_size=2048,
+                 attention_range=64,
+                 offset_before=0,
+                 offset_after=0,
+                 dropout_rate=0.1):
         super().__init__()
-        self.n_alleles = n_alleles
+        self.d_model = d_model
         self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
+        self.attention_range = attention_range
+        self.offset_before = offset_before
+        self.offset_after = offset_after
+        self.dropout_rate = dropout_rate
+        self.n_alleles = n_alleles
+        self.mask_int = n_alleles
+        self.coord_dim = coord_dim
 
-        self.embed = GenoEmbedding(n_alleles, d_model)
-        self.evo_embed = EvoEmbedding(d_model, n_evo_heads)   # ← 新增
-        self.chunk_module = ChunkModule(d_model, n_layers, **mamba_kwargs)
-        self.out_proj = nn.Linear(d_model, n_alleles)   # ← 输出 n_alleles 类概率
+        # Embedding layer
+        self.embedding = GenoEmbedding(n_alleles, self.d_model, self.coord_dim)
 
-    def forward(self, x: torch.Tensor, 
-                      x_coord: torch.Tensor, 
-                      dist: torch.Tensor | None = None):
-        """
-        x:       (B, L)    基因型整型 {-1,0,...,n-1}      
-        x_coord: (L, 4)    坐标
-        dist:    (B, B)    距离矩阵，可选
-        return:  (B, L, n_alleles) 概率，已 softmax
-        """
-        B, L_orig = x.shape
-        device = x.device
+        # Create chunk modules
+        self.chunk_module = ChunkModule(
+            d_model=self.d_model,
+            start_offset=0,
+            end_offset=0,
+            dropout_rate=self.dropout_rate
+        )
 
-        # 1. 嵌入
-        h = self.embed(x, x_coord)                      # (B,L,d)
-        h = self.evo_embed(h, dist)         # ← 样本间交叉注意力
+        # Final layers
+        self.final_conv = nn.Conv1d(self.d_model * 2, self.d_model // 2,
+                                    kernel_size=5, padding=2)
+        self.output_conv = nn.Conv1d(self.d_model // 2, n_alleles - 1,
+                                     kernel_size=5, padding=2)
 
-        # 2. 滑窗切分、重叠合并（与你原来代码完全一致，省略）
-        chunk_size = self.chunk_size
-        overlap = self.chunk_overlap
-        step = chunk_size - overlap
-        n_chunks = math.ceil((L_orig - overlap) / step)
-        pad_len = n_chunks * step + overlap - L_orig
-        if pad_len > 0:
-            h = F.pad(h, (0, 0, 0, pad_len))            # (B,L_pad,d)
-        L_pad = h.shape[1]
+        self.gelu = nn.GELU()
+        self.softmax = nn.Softmax(dim=-1)
 
-        out_buf = torch.zeros(B, L_pad, h.shape[-1], device=device)
-        count_buf = torch.zeros(B, L_pad, dtype=torch.long, device=device)
+    def forward(self, x, x_coord, x_dismat=None):
+        # x shape: (batch, seq_len, n_alleles)
+        # Embedding
+        _, seq_len, n_alleles = x.shape
+        assert n_alleles == self.n_alleles
+        x_embedded = self.embedding(x, x_coord)
 
-        for i in range(n_chunks):
-            start = i * step
-            end = start + chunk_size
-            chunk = h[:, start:end, :]
-            chunk_out = self.chunk_module(chunk)
-            out_buf[:, start:end, :] += chunk_out
-            count_buf[:, start:end] += 1
+        chunk_starts = list(range(0, seq_len, self.chunk_size))
+        chunk_ends = [min(cs + self.chunk_size, seq_len) for cs in chunk_starts]
+        mask_starts = [max(0, cs - self.attention_range) for cs in chunk_starts]
+        mask_ends = [min(ce + self.attention_range, seq_len) for ce in chunk_ends]
 
-        out_buf = out_buf / count_buf.unsqueeze(-1).clamp_min(1).float()
-        out_buf = out_buf[:, :L_orig, :]              # 去掉 pad
-        logits = self.out_proj(out_buf)               # (B,L,n_alleles)
-        probs = logits.softmax(dim=-1)
-        return probs
+        # Process chunks
+        chunk_outputs = []
+        for i in range(len(chunk_starts)):
+            pad_left  = chunk_starts[i] - mask_starts[i]
+            pad_right = mask_ends[i] - chunk_ends[i]
+            chunk_input = x_embedded[:, mask_starts[i]:mask_ends[i]]
+            chunk_output = self.chunk_module(chunk_input, x_dismat)   # 共享权重
+            if pad_left or pad_right:
+                chunk_output = F.pad(chunk_output, (0, 0, pad_left, pad_right))
+            chunk_outputs.append(chunk_output)
+        # Concatenate chunks along sequence dimension
+        x_concat = torch.cat(chunk_outputs, dim=1)
 
-# # 只在 EvoFill 里动刀，其余类不动
-# class EvoFill(nn.Module):
-#     def __init__(
-#         self,
-#         n_alleles: int,
-#         chunk_size: int,
-#         d_model: int = 256,
-#         n_evo_heads: int = 8,
-#         n_layers: int = 4,
-#         chunk_overlap: int = 64,
-#         **mamba_kwargs,
-#     ):
-#         super().__init__()
-#         self.n_alleles = n_alleles
-#         self.chunk_size = chunk_size
-#         self.chunk_overlap = chunk_overlap
-#         self.n_layers = n_layers
-#         self.mamba_kwargs = mamba_kwargs
+        # # Final processing
+        x_concat = x_concat.transpose(1, 2)  # (batch, features, seq_len)
+        x_final = self.gelu(self.final_conv(x_concat))
+        x_output = self.output_conv(x_final)
+        x_output = x_output.transpose(1, 2)  # (batch, seq_len, n_alleles-1)
 
-#         self.embed = GenoEmbedding(n_alleles, d_model)
-#         self.evo_embed = EvoEmbedding(d_model, n_evo_heads)
-#         # ① 不再用单个 chunk_module，而是 ModuleList，初始为空
-#         self.chunk_modules = nn.ModuleList()
-#         self.out_proj = nn.Linear(d_model, n_alleles)
+        # Apply offsets
+        if self.offset_before > 0 or self.offset_after > 0:
+            x_output = x_output[:, self.offset_before:self.seq_len - self.offset_after]
 
-#     def _get_chunk_module(self, idx: int, device: torch.device) -> ChunkModule:
-#         """动态获取第 idx 个 chunk 的独立模块，不存在就现建，并保证在同设备。"""
-#         while idx >= len(self.chunk_modules):
-#             # 新建
-#             new_mod = ChunkModule(
-#                 d_model=self.out_proj.in_features,
-#                 n_layers=self.n_layers,
-#                 **self.mamba_kwargs,
-#             )
-#             # 关键：立即搬到指定设备
-#             new_mod.to(device)
-#             self.chunk_modules.append(new_mod)
-#         return self.chunk_modules[idx]
+        x_output = self.softmax(x_output)
 
-#     def forward(self, x: torch.Tensor,
-#                 x_coord: torch.Tensor,
-#                 dist: torch.Tensor | None = None):
-#         B, L_orig = x.shape
-#         device = x.device
+        return x_output
 
-#         # 1. 嵌入
-#         h = self.embed(x, x_coord)
-#         h = self.evo_embed(h, dist)
-
-#         # 2. 滑窗切分参数
-#         chunk_size = self.chunk_size
-#         overlap = self.chunk_overlap
-#         step = chunk_size - overlap
-#         n_chunks = math.ceil((L_orig - overlap) / step)
-#         pad_len = n_chunks * step + overlap - L_orig
-#         if pad_len > 0:
-#             h = F.pad(h, (0, 0, 0, pad_len))
-#         L_pad = h.shape[1]
-
-#         out_buf = torch.zeros(B, L_pad, h.shape[-1], device=device)
-#         count_buf = torch.zeros(B, L_pad, dtype=torch.long, device=device)
-
-#         # 3. 每个 chunk 用独立权重
-#         for i in range(n_chunks):
-#             start = i * step
-#             end = start + chunk_size
-#             chunk = h[:, start:end, :]
-#             chunk_out = self._get_chunk_module(i, device)(chunk)
-#             out_buf[:, start:end, :] += chunk_out
-#             count_buf[:, start:end] += 1
-
-#         out_buf = out_buf / count_buf.unsqueeze(-1).clamp_min(1).float()
-#         out_buf = out_buf[:, :L_orig, :]
-#         logits = self.out_proj(out_buf)
-#         probs = logits.softmax(dim=-1)
-#         return probs
-
-# unit test
-if __name__ == "__main__":
-    n_alleles = 3          # 真实 0,1,2 三类，-1 为缺失
+if __name__ == '__main__':
+    n_alleles = 4  # 包含missing
     model = EvoFill(
-        n_alleles=n_alleles,
-        chunk_size=5120,
-        chunk_overlap=64,
         d_model=256,
-        n_layers=4,
-        d_state=128,
-        expand=2,
+        chunk_size=5120,
+        n_alleles=n_alleles,
+        attention_range=64, 
+        offset_before=0,
+        offset_after=0,
+        dropout_rate=0.1,
     ).cuda()
 
-    B, L = 2, 56135
-    x = torch.randint(-1, n_alleles, (B, L)).long().cuda()   # {-1,0,1,2}
-    x_coord = torch.randn(L, 4).cuda()                   # (L,4)
+    B, L = 2, 5120 
 
-    probs = model(x, x_coord)
-    print(probs.shape)  # ✅ torch.Size([2, 1800, 3])
+    # 1. 生成输入
+    x = torch.randint(0, n_alleles, (B, L)).long().cuda()   # {0,1,2,3} 3=missing
+    x_coord = torch.randn(L, 4).cuda()   
+
+    # 2. -1 -> 3，并构造 one-hot（4 维）
+    x_map = x.clone()
+    x_onehot = torch.zeros(B, L, n_alleles, device='cuda')
+    x_onehot.scatter_(2, x_map.unsqueeze(-1), 1)
+
+    # 3. 前向
+    with torch.no_grad():
+        probs = model(x_onehot, x_coord)          # shape: (B,L,3)
+
+    # 4. 简单校验
+    assert torch.allclose(probs.sum(dim=-1), torch.ones(B, L, device='cuda'), atol=1e-5), \
+        "概率未归一"
+    print("✅ 含缺失数据前向通过，输出形状:", probs.shape)

@@ -26,7 +26,6 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 from src.utils import load_config
 from src.model import EvoFill
-# from src.model_transformer import EvoFill
 from src.losses import ImputationLoss
 
 MAF_BINS = [(0.00, 0.05), (0.05, 0.10), (0.10, 0.20),
@@ -36,55 +35,38 @@ def unwrap(model):
     """返回真实模型，不管外面包了几层 DDP / FSDP."""
     return model.module if hasattr(model, 'module') else model
 
-def expand_gt_to_one_hot(logits: torch.Tensor, gt_true: torch.Tensor):
-    """
-    将 gt_true 从 (B, L) 转换为与 logits 同形状的 one-hot 编码 (B, L, C)。
-
-    Parameters
-    ----------
-    logits : torch.Tensor
-        模型输出，形状 (B, L, C)，任意浮点 dtype。
-    gt_true : torch.Tensor
-        真实标签，形状 (B, L)，元素范围 0~C-1，整数 dtype。
-
-    Returns
-    -------
-    torch.Tensor
-        one-hot 编码，形状 (B, L, C)，与 logits 同设备、同 dtype。
-    """
-    B, L, C = logits.shape
-    assert gt_true.shape == (B, L), f"gt_true shape {gt_true.shape} != ({B}, {L})"
-
-    # 1. 先转成 one-hot，此时是 (B, L, C) 的 0/1 值，dtype 为 uint8 / int64
-    one_hot = F.one_hot(gt_true, num_classes=C)   # (B, L, C)
-
-    # 2. 把 dtype 和设备对齐到 logits，方便后续计算损失
-    one_hot = one_hot.to(dtype=logits.dtype, device=logits.device)
-
-    return one_hot
-
 class GenotypeDataset(Dataset):
-    def __init__(self, gts, coords, mask_int = -1, mask_ratio=0.0):
-        self.gt_true = gts.long()          # 原始完整标签
-        self.coords = coords.float()
+    def __init__(self, gts, coords, mask_int=None, mask_ratio=0.0):
+        """
+        gts: (N, L, A)  one-hot  float  —— 原始完整标签（含缺失向量）
+        coords: (L, 4)
+        mask_int: 缺失对应的类别下标，None 则默认为最后一维
+        mask_ratio: 训练时额外随机遮掩的比例
+        """
+        self.gt_true = gts.float() 
+        self.coords  = coords.float()
         self.mask_ratio = mask_ratio
+
+        if mask_int is None:
+            mask_int = self.gt_true.shape[-1] - 1
         self.mask_int = mask_int
 
     def __len__(self):
         return self.gt_true.shape[0]
 
     def __getitem__(self, idx):
-        gt_true = self.gt_true[idx]        # 完整标签
-        coords = self.coords                # (L, 4)
+        gt_true = self.gt_true[idx]                # (L, A)  只读
+        gt_mask = gt_true.clone()                  # (L, A)  可修改
 
-        # 训练时额外随机遮掩
-        gt_mask = gt_true.clone()
+        # ---- 仅对 gt_mask 做随机遮掩 ----
         if self.mask_ratio > 0:
-            mask = torch.rand_like(gt_mask.float()) < self.mask_ratio
-            gt_mask[mask] = self.mask_int              # 仅输入被遮掩
+            L = gt_true.shape[0]
+            rand_mask = torch.rand(L, device=gt_mask.device) < self.mask_ratio
+            gt_mask[rand_mask] = 0.                    # 全 0
+            gt_mask[rand_mask, self.mask_int] = 1.     # 缺失类别置 1
 
-        # 返回：输入（含缺失）、原始标签、坐标
-        return gt_mask, gt_true, coords 
+        return gt_mask, gt_true, self.coords
+
 
 def collate_fn(batch):
     """
@@ -111,20 +93,27 @@ def build_loader(pt_path, batch_size, shuffle, mask_int, mask_ratio, sampler=Non
         pin_memory=True,
     )
 
-def precompute_maf(gts_np, mask_int=-1):
+def precompute_maf(gts_oh, mask_int=None):
     """
-    gts_np: (N, L)  int64
+    gts_oh: (N, L, A)  one-hot  float32/64
+    mask_int: 缺失对应的类别下标，None 则默认为最后一维
     return:
         maf: (L,) float32
-        bin_cnt: list[int] 长度 6，对应 6 个 bin 的位点数量
+        bin_cnt: list[int] 长度 6
     """
-    L = gts_np.shape[1]
+    if mask_int is None:
+        mask_int = gts_oh.shape[-1] - 1
+
+    # 从 one-hot 反推类别索引
+    gts_idx = gts_oh.argmax(-1).numpy()  # (N, L)  int
+
+    N, L = gts_idx.shape
     maf = np.zeros(L, dtype=np.float32)
     bin_cnt = [0] * 6
 
     for l in range(L):
-        alleles = gts_np[:, l]
-        alleles = alleles[alleles != mask_int]   # 去掉缺失
+        alleles = gts_idx[:, l]
+        alleles = alleles[alleles != mask_int]  # 去掉缺失
         if alleles.size == 0:
             maf[l] = 0.0
             continue
@@ -132,7 +121,7 @@ def precompute_maf(gts_np, mask_int=-1):
         uniq, cnt = np.unique(alleles, return_counts=True)
         total = cnt.sum()
         freq = cnt / total
-        freq[::-1].sort()
+        freq[::-1].sort()  # 降序
         maf_val = freq[1] if len(freq) > 1 else 0.0
         maf[l] = maf_val
 
@@ -144,16 +133,17 @@ def precompute_maf(gts_np, mask_int=-1):
 
     return torch.from_numpy(maf), bin_cnt
 
-def imputation_maf_accuracy_epoch(all_logits, all_gts, all_mask, global_maf):
+def imputation_maf_accuracy_epoch(all_logits, all_gts_oh, all_mask, global_maf):
     """
     all_logits: (N, L, A)
-    all_gts:    (N, L)
-    all_mask:   (N, L)   -1 位点为 True
-    global_maf: (L,)     已预计算好
+    all_gts_oh: (N, L, A)  one-hot
+    all_mask:   (N, L)     True 表示该位点被遮掩
+    global_maf: (L,)       已预计算好
     """
-    preds = torch.argmax(all_logits, dim=-1)      # (N, L)
-    correct = (preds == all_gts) & all_mask       # (N, L)
-    maf = global_maf.unsqueeze(0)                 # (1, L)
+    preds = torch.argmax(all_logits, dim=-1)        # (N, L)
+    gts   = torch.argmax(all_gts_oh, dim=-1)        # (N, L)
+    correct = (preds == gts) & all_mask             # (N, L)
+    maf = global_maf.unsqueeze(0)                   # (1, L)
 
     accs = []
     for lo, hi in MAF_BINS:
@@ -174,8 +164,7 @@ def train_epoch(model, cfg, loader, criterion, optimizer, device, rank,
         gt_mask, gt_true, coords = gt_mask.to(device), gt_true.to(device), coords.to(device)
 
         logits = model(gt_mask, coords)
-        gt_true_oh = expand_gt_to_one_hot(logits, gt_true)
-        loss, logs = criterion(logits, gt_true_oh)
+        loss, logs = criterion(logits, gt_true)
 
         optimizer.zero_grad()
         loss.backward()
@@ -203,7 +192,8 @@ def train_epoch(model, cfg, loader, criterion, optimizer, device, rank,
         for gt_mask, gt_true, coords in pbar:
             gt_mask, gt_true = gt_mask.to(device), gt_true.to(device)
             logits = model(gt_mask, coords) 
-            mask = gt_mask == -1
+            
+            mask = gt_mask[..., model.mask_int] == 1 
             all_logits.append(logits.cpu())
             all_gts.append(gt_true.cpu())
             all_mask.append(mask.cpu())
@@ -232,11 +222,10 @@ def validate(model, cfg, loader, criterion, device, rank, global_maf, writer=Non
         for gt_mask, gt_true, coords in pbar:
             gt_mask, gt_true, coords = gt_mask.to(device), gt_true.to(device), coords.to(device)
             logits = model(gt_mask, coords)
-            gt_true_oh = expand_gt_to_one_hot(logits, gt_true)
-            loss, logs = criterion(logits, gt_true_oh)
+            loss, logs = criterion(logits, gt_true)
             total_loss += loss.item()
 
-            mask = gt_mask == -1
+            mask = gt_mask[..., model.mask_int] == 1 
             all_logits.append(logits.cpu())
             all_gts.append(gt_true.cpu())
             all_mask.append(mask.cpu())
