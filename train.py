@@ -37,13 +37,7 @@ def unwrap(model):
 
 class GenotypeDataset(Dataset):
     def __init__(self, gts, coords, mask_int=None, mask_ratio=0.0):
-        """
-        gts: (N, L, A)  one-hot  float  —— 原始完整标签（含缺失向量）
-        coords: (L, 4)
-        mask_int: 缺失对应的类别下标，None 则默认为最后一维
-        mask_ratio: 训练时额外随机遮掩的比例
-        """
-        self.gt_true = gts.float() 
+        self.gt_true = gts.float()
         self.coords  = coords.float()
         self.mask_ratio = mask_ratio
 
@@ -51,21 +45,25 @@ class GenotypeDataset(Dataset):
             mask_int = self.gt_true.shape[-1] - 1
         self.mask_int = mask_int
 
+        # 计算需要保留的通道索引（去掉缺失通道）
+        self.keep_idx = [i for i in range(self.gt_true.shape[-1]) if i != self.mask_int]
+
     def __len__(self):
         return self.gt_true.shape[0]
 
     def __getitem__(self, idx):
-        gt_true = self.gt_true[idx]                # (L, A)  只读
-        gt_mask = gt_true.clone()                  # (L, A)  可修改
+        gt_true = self.gt_true[idx]                # (L, A)
+        gt_mask = gt_true.clone()                  # (L, A)
 
-        # ---- 仅对 gt_mask 做随机遮掩 ----
         if self.mask_ratio > 0:
             L = gt_true.shape[0]
             rand_mask = torch.rand(L, device=gt_mask.device) < self.mask_ratio
-            gt_mask[rand_mask] = 0.                    # 全 0
-            gt_mask[rand_mask, self.mask_int] = 1.     # 缺失类别置 1
+            gt_mask[rand_mask] = 0.
+            gt_mask[rand_mask, self.mask_int] = 1.
 
-        return gt_mask, gt_true, self.coords
+        # 去掉缺失通道
+        gt_true_no_mask = gt_true[..., self.keep_idx]   # (L, A-1)
+        return gt_mask, gt_true_no_mask, self.coords
 
 
 def collate_fn(batch):
@@ -79,7 +77,7 @@ def collate_fn(batch):
     return gt_mask, gt_true, coords
 
 
-def build_loader(pt_path, batch_size, shuffle, mask_int, mask_ratio, sampler=None):
+def build_loader(pt_path, batch_size, shuffle, mask_int=None, mask_ratio=0.0, sampler=None):
     data = torch.load(pt_path)
     dataset = GenotypeDataset(data['gts'], data['coords'], mask_int=mask_int, mask_ratio=mask_ratio)
     return DataLoader(
@@ -105,7 +103,7 @@ def precompute_maf(gts_oh, mask_int=None):
         mask_int = gts_oh.shape[-1] - 1
 
     # 从 one-hot 反推类别索引
-    gts_idx = gts_oh.argmax(-1).numpy()  # (N, L)  int
+    gts_idx = gts_oh.argmax(-1)  # (N, L)  int
 
     N, L = gts_idx.shape
     maf = np.zeros(L, dtype=np.float32)
@@ -164,6 +162,8 @@ def train_epoch(model, cfg, loader, criterion, optimizer, device, rank,
         gt_mask, gt_true, coords = gt_mask.to(device), gt_true.to(device), coords.to(device)
 
         logits = model(gt_mask, coords)
+        
+        # print('shape: gt_mask',gt_mask.shape,'gt_true',gt_true.shape,'logits', logits.shape)
         loss, logs = criterion(logits, gt_true)
 
         optimizer.zero_grad()
@@ -307,8 +307,10 @@ def main():
 
     # 2. 数据 loader（训练集加 DistributedSampler）
     train_data = torch.load(Path(cfg.data.path) / "train.pt")
+    n_alleles = train_data['gts'].shape[-1]
     global_maf, bin_cnt = precompute_maf(train_data['gts'].numpy(), mask_int=-1)
     if rank == 0:
+        print(f'Detected {n_alleles} alleles in training set (including missing label)')
         print('Train MAF-bin counts:', bin_cnt)
 
     train_sampler = DistributedSampler(
@@ -322,7 +324,6 @@ def main():
         Path(cfg.data.path) / "train.pt",
         batch_size=cfg.train.batch_size,
         shuffle=False,  # sampler 控制
-        mask_int = -1,
         mask_ratio=cfg.train.mask_ratio,
         sampler=train_sampler,
     )
@@ -330,15 +331,15 @@ def main():
         Path(cfg.data.path) / "val.pt",
         batch_size=cfg.train.batch_size,
         shuffle=False,
-        mask_int = -1,
         mask_ratio=cfg.train.mask_ratio,
         sampler=None,
     )
 
     # 3. 模型 -> DDP
+    cfg.model.n_alleles = n_alleles
     model = EvoFill(**vars(cfg.model)).to(device)
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,find_unused_parameters=True)
 
     # ===== 新增：TensorBoard =====
     writer = None

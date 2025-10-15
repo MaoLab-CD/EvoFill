@@ -389,6 +389,7 @@ class EvoFill(nn.Module):
         # Apply offsets
         if self.offset_before > 0 or self.offset_after > 0:
             x_output = x_output[:, self.offset_before:self.seq_len - self.offset_after]
+        x_output = x_output[:, :seq_len, :]
 
         x_output = self.softmax(x_output)
 
@@ -406,7 +407,7 @@ if __name__ == '__main__':
         dropout_rate=0.1,
     ).cuda()
 
-    B, L = 2, 5120 
+    B, L = 2, 8192 
 
     # 1. 生成输入
     x = torch.randint(0, n_alleles, (B, L)).long().cuda()   # {0,1,2,3} 3=missing
