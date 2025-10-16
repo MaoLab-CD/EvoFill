@@ -378,8 +378,11 @@ class ImputationLoss(nn.Module):
                         pred_alt_allele_probs, gt_alt_af)) * group_size
 
                 total_loss += r2_loss
+        logs = {'ce':ce_loss,
+                'kl':kl_loss,
+                'r2':r2_loss}
 
-        return total_loss
+        return total_loss, logs
 
 if __name__ == "__main__":
     B, L = 12, 1000
@@ -389,5 +392,6 @@ if __name__ == "__main__":
     # targets[0, :10] = -1   # 模拟缺失
 
     loss_fn = ImputationLoss(use_r2=True)
-    loss = loss_fn(logits, y_true_oh)
-    print(loss.item())          # 应在 0.x ~ 2.x 之间
+    loss, logs= loss_fn(logits, y_true_oh)
+    print(loss.item())
+    print(logs)

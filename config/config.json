@@ -4,31 +4,20 @@
     "path": "data/sim_s2_251011",
     "train_vcf"   : "/home/qmtang/mnt_qmtang/EvoFill/data/sim_s2_250901/YRI_CEU_chr22.vcf.gz",
     "val_vcf"   : "/home/qmtang/mnt_qmtang/EvoFill/data/sim_s2_250901/CHB_chr22.bgzf.vcf.gz",
-    "tihp": "True",
-    "n_alleles": 3
+    "tihp": "True"
   },
   "model": {
-    "n_alleles": 3,
-    "chunk_size": 8192,
-    "chunk_overlap": 128,
-    "d_model": 128,
-    "n_evo_heads": 8,
-    "n_layers": 4,
-    "d_state": 64,
-    "expand": 2
-  },
-  "model_zq":{
     "d_model":256,
-    "n_heads":8,
     "chunk_size":5120,
-    "attention_range":64,
+    "n_alleles":14,
+    "attention_range":64, 
     "offset_before":0,
     "offset_after":0,
     "dropout_rate":0.1
   },
   "train": {
     "seed": 3407,
-    "batch_size": 16,
+    "batch_size": 8,
     "lr": 1e-4,
     "min_lr": 1e-7,
     "weight_decay": 0.01,
