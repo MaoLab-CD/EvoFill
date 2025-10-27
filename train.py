@@ -24,134 +24,54 @@ from torch_optimizer import Lamb
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from tqdm import tqdm
-from src.utils import load_config
+from src.utils import load_config, precompute_maf, imputation_maf_accuracy_epoch
 from src.model import EvoFill
 from src.losses import ImputationLoss
 
-MAF_BINS = [(0.00, 0.05), (0.05, 0.10), (0.10, 0.20),
-        (0.20, 0.30), (0.30, 0.40), (0.40, 0.50)]
 
 def unwrap(model):
     """返回真实模型，不管外面包了几层 DDP / FSDP."""
     return model.module if hasattr(model, 'module') else model
 
-class GenotypeDataset(Dataset):
-    def __init__(self, gts, coords, mask_int=None, mask_ratio=0.0):
-        self.gt_true = gts.float()
-        self.coords  = coords.float()
-        self.mask_ratio = mask_ratio
+class GenomicDataset(Dataset):
+    """Dataset class for genomic data with masking for training"""
 
-        if mask_int is None:
-            mask_int = self.gt_true.shape[-1] - 1
-        self.mask_int = mask_int
-
-        # 计算需要保留的通道索引（去掉缺失通道）
-        self.keep_idx = [i for i in range(self.gt_true.shape[-1]) if i != self.mask_int]
+    def __init__(self, x_gts, x_extra=None, seq_depth=4,
+                 mask=True, masking_rates=(0.5, 0.99)):
+        self.gts = x_gts
+        self.x_extra = x_extra
+        self.seq_depth = seq_depth
+        self.mask = mask
+        self.masking_rates = masking_rates
 
     def __len__(self):
-        return self.gt_true.shape[0]
+        return len(self.gts)
 
     def __getitem__(self, idx):
-        gt_true = self.gt_true[idx]                # (L, A)
-        gt_mask = gt_true.clone()                  # (L, A)
+        x       = self.gts[idx].copy()
+        y       = self.gts[idx]
+        if self.x_extra is not None:
+            x_extra = self.x_extra[idx]
+        else:
+            x_extra = None
 
-        if self.mask_ratio > 0:
-            L = gt_true.shape[0]
-            rand_mask = torch.rand(L, device=gt_mask.device) < self.mask_ratio
-            gt_mask[rand_mask] = 0.
-            gt_mask[rand_mask, self.mask_int] = 1.
+        if self.mask:
+            # Apply masking
+            seq_len = len(x)
+            masking_rate = np.random.uniform(*self.masking_rates)
+            mask_size = int(seq_len * masking_rate)
+            mask_indices = np.random.choice(seq_len, mask_size, replace=False)
+            x[mask_indices] = self.seq_depth - 1  # Missing value token
 
-        # 去掉缺失通道
-        gt_true_no_mask = gt_true[..., self.keep_idx]   # (L, A-1)
-        return gt_mask, gt_true_no_mask, self.coords
+        # Convert to one-hot
+        x_onehot = np.eye(self.seq_depth)[x]
+        y_onehot = np.eye(self.seq_depth - 1)[y]
 
-
-def collate_fn(batch):
-    """
-    batch: List[(gt_mask, gt_true, coords)] 每个 coords 形状相同
-    返回：gt_mask, gt_true, coords（二维，直接取第 0 个即可
-    """
-    gt_mask  = torch.stack([b[0] for b in batch], 0)
-    gt_true  = torch.stack([b[1] for b in batch], 0)
-    coords   = batch[0][2]          # 全局共享
-    return gt_mask, gt_true, coords
+        return torch.FloatTensor(x_onehot),torch.FloatTensor(x_extra), torch.FloatTensor(y_onehot)
 
 
-def build_loader(pt_path, batch_size, shuffle, mask_int=None, mask_ratio=0.0, sampler=None):
-    data = torch.load(pt_path)
-    dataset = GenotypeDataset(data['gts'], data['coords'], mask_int=mask_int, mask_ratio=mask_ratio)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=(shuffle and sampler is None),  # 有 sampler 时关闭 shuffle
-        drop_last=shuffle,
-        collate_fn=collate_fn,
-        sampler=sampler,
-        num_workers=4,
-        pin_memory=True,
-    )
 
-def precompute_maf(gts_oh, mask_int=None):
-    """
-    gts_oh: (N, L, A)  one-hot  float32/64
-    mask_int: 缺失对应的类别下标，None 则默认为最后一维
-    return:
-        maf: (L,) float32
-        bin_cnt: list[int] 长度 6
-    """
-    if mask_int is None:
-        mask_int = gts_oh.shape[-1] - 1
-
-    # 从 one-hot 反推类别索引
-    gts_idx = gts_oh.argmax(-1)  # (N, L)  int
-
-    N, L = gts_idx.shape
-    maf = np.zeros(L, dtype=np.float32)
-    bin_cnt = [0] * 6
-
-    for l in range(L):
-        alleles = gts_idx[:, l]
-        alleles = alleles[alleles != mask_int]  # 去掉缺失
-        if alleles.size == 0:
-            maf[l] = 0.0
-            continue
-
-        uniq, cnt = np.unique(alleles, return_counts=True)
-        total = cnt.sum()
-        freq = cnt / total
-        freq[::-1].sort()  # 降序
-        maf_val = freq[1] if len(freq) > 1 else 0.0
-        maf[l] = maf_val
-
-        # 统计 bin
-        for i, (lo, hi) in enumerate(MAF_BINS):
-            if lo <= maf_val < hi:
-                bin_cnt[i] += 1
-                break
-
-    return torch.from_numpy(maf), bin_cnt
-
-def imputation_maf_accuracy_epoch(all_logits, all_gts_oh, all_mask, global_maf):
-    """
-    all_logits: (N, L, A)
-    all_gts_oh: (N, L, A)  one-hot
-    all_mask:   (N, L)     True 表示该位点被遮掩
-    global_maf: (L,)       已预计算好
-    """
-    preds = torch.argmax(all_logits, dim=-1)        # (N, L)
-    gts   = torch.argmax(all_gts_oh, dim=-1)        # (N, L)
-    correct = (preds == gts) & all_mask             # (N, L)
-    maf = global_maf.unsqueeze(0)                   # (1, L)
-
-    accs = []
-    for lo, hi in MAF_BINS:
-        bin_mask = all_mask & (maf >= lo) & (maf < hi)
-        n_cor = (correct & bin_mask).sum()
-        n_tot = bin_mask.sum()
-        accs.append((n_cor / n_tot).item() if n_tot > 0 else 0.0)
-    return accs
-
-def train_epoch(model, cfg, loader, criterion, optimizer, device, rank,
+def train_epoch(model, loader, criterion, optimizer, device, rank,
                 global_maf, writer=None, global_step=0):
     model.train()
     total_loss = 0.0
