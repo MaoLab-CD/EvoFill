@@ -1,8 +1,9 @@
 
-from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from typing import List, Optional, Union
 
 from mamba_ssm import Mamba2
 from mamba_ssm.modules.mamba2_simple import Mamba2Simple as Mamba2Block # 原Mamba2Block
@@ -335,95 +336,122 @@ class ChunkModule(nn.Module):
 
         return xa
 
-class LongRangeModule(nn.Module):
+class UltraLongRangeMamba(nn.Module):
     """
-    调用接口：
-        x = self.long_range(x, mask)
-    参数：
-        total_sites   : 序列最大长度（决定 Embedding 词表大小）
-        d_model   : 输入特征维
-        chunk_size: 距离阈值
-        cos_cutoff: 余弦相似度绝对值阈值
-        d_emb     : embedding 维，默认 d_model//2
+    线性复杂度 O(L) 全局建模，只激活 mask=1 的位点
     """
-    def __init__(self, total_sites, d_model, chunk_size=128, cos_cutoff=0.8, d_emb=None):
+    def __init__(self, d_model, d_state=64, d_conv=4, expand=2,
+                 n_layers=2, dropout=0.1):
         super().__init__()
-        self.total_sites = total_sites
-        self.d_model = d_model
-        self.chunk_size = chunk_size
-        self.cos_cutoff = cos_cutoff
-        self.d_emb = d_emb or (d_model // 2)
+        self.d_inner = int(d_model * expand)
+        # 可选：多层 Mamba2
+        self.layers = nn.ModuleList([
+            BiMambaBlock(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            for _ in range(n_layers)
+        ])
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
-        # 两个稀疏梯度 的 Embedding
-        self.emb_i = nn.Embedding(self.total_sites, self.d_emb, sparse=True)
-        self.emb_j = nn.Embedding(self.total_sites, self.d_emb, sparse=True)
-
-
-    def forward(self, x, mask):
+    def forward(self, x, idx):
         """
-        x    : (B, L, d_model)
-        mask : (L,)  0/1 或 True/False
-        return: 同 shape 的 x_out
+        x: (B, L_all, d_model)  全局张量，其余位置为 nan
+        idx: (M,)  当前 mask=1 的坐标
+        返回: (B, M, d_model//2)
         """
-        # 1. 有效位点
-        idx = torch.where(mask == 1)[0]          # (N_valid,)
-        N_valid = idx.size(0)
-        if N_valid == 0:
-            return x
-
-        # 2. 距离矩阵 & 是否有 far j
-        dist = torch.abs(idx[:, None] - idx[None, :])          # (N_valid, N_valid)
-        far_mask = dist > self.chunk_size
-        if far_mask.sum() == 0:           # 一个 far j 都没有直接返回
-            return x 
-
-        emb_i_w = self.emb_i(idx)
-        emb_j_w = self.emb_j(idx)
-        cos_sim = torch.abs(F.cosine_similarity(emb_i_w.unsqueeze(1),
-                                                emb_j_w.unsqueeze(0), dim=-1))
-
-        # 4. 过滤
-        valid_j_mask = far_mask & (cos_sim > self.cos_cutoff)
-
-        # 5. 加权更新
-        x_out = x.clone()
-        for row, i_global in enumerate(idx):
-            j_local_mask = valid_j_mask[row]
-            num_j = j_local_mask.sum()
-            if num_j == 0:
-                continue
-            j_local = torch.where(j_local_mask)[0]
-            j_global = idx[j_local]
-            weights = cos_sim[row, j_local] / num_j
-            xj_weighted = (x[:, j_global] * weights.view(1, -1, 1)).sum(dim=1)
-            x_out[:, i_global] = (x[:, i_global] + xj_weighted) / 2
-        return x_out
+        # 只取有效 token
+        x_in = x[:, idx] 
+        x_in = self.dropout(x_in)                                   # (B, M, D)
+        for layer in self.layers:
+            x_in = layer(x_in)                              # BiMamba2
+        return self.norm(x_in)
 
 class GlobalOut(nn.Module):
-    def __init__(self,
-                 d_model: int,
-                 n_alleles: int,
-                 total_sites: int,
-                 chunk_size: int,
-                 cos_cutoff: float = 0.8):
+    def __init__(self, d_model, n_alleles, total_sites, chunk_size,
+                 kernel=5, pad=2, stripe=4096,
+                 d_state=64, d_conv=4, expand=2, n_mamba_layers=2):
         super().__init__()
-        self.proj_in = nn.Linear(2 * d_model, d_model//2)
-        self.long_range = LongRangeModule(
-                total_sites=total_sites,
-                d_model=d_model//2,
-                chunk_size=chunk_size,
-                cos_cutoff=cos_cutoff
-            )
-        self.proj_out = nn.Linear(d_model//2, n_alleles - 1)
+        self.k, self.p = kernel, pad
+        self.stripe = stripe
+        self.total_sites = total_sites
+        self.n_alleles = n_alleles
 
+        # -------------- 1) 局部卷积权重 --------------
+        # Conv1: 2*d_model -> d_model//2
+        self.w1 = nn.Parameter(torch.empty(d_model // 2, 2 * d_model, kernel))
+        self.b1 = nn.Parameter(torch.zeros(d_model // 2))
+        # Conv2: d_model//2 -> n_alleles-1
+        self.w2 = nn.Parameter(torch.empty(n_alleles - 1, d_model // 2, kernel))
+        self.b2 = nn.Parameter(torch.zeros(n_alleles - 1))
+        nn.init.kaiming_normal_(self.w1)
+        nn.init.kaiming_normal_(self.w2)
 
+        # -------------- 2) ulr 中间件（Mamba2） --------------
+        self.ulr_mamba = UltraLongRangeMamba(
+            d_model=d_model//2,          # 与 Conv1 输出同维
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            n_layers=n_mamba_layers,
+        )
+        self.gate = nn.Linear(d_model, 2)   # [local; global] -> 2
+        self.norm = nn.LayerNorm(d_model // 2)
+
+        # -------------- 3) 开关 --------------
+        self.skip_ulr = True
+        self.set_ulr_enabled(False)
+
+    # ============ 两阶段切换 ============
+    def set_ulr_enabled(self, enabled: bool):
+        self.skip_ulr = not enabled
+        for p in self.ulr_mamba.parameters():
+            p.requires_grad = enabled
+        for p in self.gate.parameters():
+            p.requires_grad = enabled
+
+    # ============ 前向：ulr 是可插拔中间件 ============
     def forward(self, x, mask):
-        x = self.proj_in(x)                       # (B, L, d_model)
-        x = self.long_range(x, mask)              # + 稀疏长程信号
-        x = self.proj_out(x)                      # (B, L, n_alleles-1)
-        x = torch.where(mask.unsqueeze(0).unsqueeze(-1).bool(),
-                        x, torch.tensor(-float('inf'), device=x.device))
-        return F.softmax(x, dim=-1)
+        """
+        x:   (B, L,  2*d_model)
+        mask:(L,) 0/1
+        return: (B, L, n_alleles-1)
+        """
+        x = x.transpose(1, 2)  # (B, 2*d_model, L)
+        device = x.device
+        idx = torch.where(mask)[0]                # 有效坐标 M
+        n = idx.shape[0]
+        out = torch.full((x.shape[0], self.w2.shape[0], x.shape[2]), -float('inf'),
+                         device=device, dtype=x.dtype)
+
+        # ---- 1) 统一走 Conv1：2*d_model -> d_model//2 ----
+        h_local = []                              # (B, d_model//2, M)
+        for i in range(0, n, self.stripe):
+            sl = slice(i, i + self.stripe)
+            idx_i = idx[sl]
+            x_i = x[..., idx_i].contiguous()      # (B, 2*d_model, stripe)
+
+            y1 = checkpoint(self._band_conv1, x_i, self.w1, self.b1, use_reentrant=False)
+            h_local.append(y1)
+        h_local = torch.cat(h_local, dim=2).transpose(1, 2)  # (B, M, d_model//2)
+        # ---- 2) ulr 中间件（可选） ----
+        if self.skip_ulr:
+            # 第一阶段：不做任何全局事，h_local 保持原样
+            fused = h_local
+        else:
+            # 第二阶段：Mamba2 全局建模并融合
+            h_global = self.ulr_mamba(h_local, idx)           # (B, M, d_model//2)
+            gate_in = torch.cat([h_local, h_global], dim=-1)  # (B, M, d_model)
+            w = torch.softmax(self.gate(gate_in), dim=-1)     # (B, M, 2)
+            fused = w[..., 0:1] * h_local + w[..., 1:2] * h_global
+            fused = self.norm(fused)                          # (B, M, d_model//2)
+
+        # ---- 3) 统一走 Conv2：d_model//2 -> n_alleles-1 ----
+        y_final = F.conv1d(fused.transpose(1, 2), self.w2, self.b2, padding=self.p)
+        out[..., idx] = y_final
+        return F.softmax(out.transpose(1, 2), dim=-1)
+
+    # ---------- 辅助 ----------
+    def _band_conv1(self, x, w, b):
+        return F.gelu(F.conv1d(x, w, b, padding=self.p))
 
 class EvoFill(nn.Module):
     def __init__(
@@ -458,7 +486,7 @@ class EvoFill(nn.Module):
             ChunkModule(d_model, dropout_rate) for s, e in zip(starts, ends)
         )
 
-        # 3. 全局输出层（始终 GPU）
+        # 3. 全局输出层
         self.global_out = GlobalOut(d_model, n_alleles, total_sites, chunk_size)
 
         # 4. chunk 掩码表  (n_chunks, L)
@@ -468,80 +496,51 @@ class EvoFill(nn.Module):
         ).float()
         self.register_buffer("chunk_masks", masks)
 
-    def forward(self, x: torch.Tensor, chunk_id: int,
-                x_extra: Optional[torch.Tensor] = None):
-        """
-        x:       (B, len, n_alleles)  对应chunk部分的序列 one-hot
-        chunk_id: 0..n_chunks-1
-        x_extra:  (B, extra_dim) or None
-        return:   (B, len, n_alleles-1)  对应chunk部分的softmax 概率
-        """
-        B, _ , _ = x.shape
+    def forward(self,
+            x: torch.Tensor,                 # (B, L, n_alleles) one-hot
+            chunk_id: Union[int, List[int]],
+            x_extra: Optional[torch.Tensor] = None
+            ):
+
+        batch_size = x.shape[0]
         device = x.device
-        s, e = self.starts[chunk_id].item(), self.ends[chunk_id].item()
-        mask = self.chunk_masks[chunk_id]          # (L,)  当前 chunk 覆盖区
+        if x_extra is not None and x_extra.shape[0] != batch_size:
+            x_extra = None
 
-        # 1. 确保输入 x 的形状与对应 chunk 吻合
-        assert x.shape[1] == e-s
+        # 统一成 list
+        if isinstance(chunk_id, int):
+            mask = self.chunk_masks[chunk_id].bool()          # 单 chunk
+            chunk_id = [chunk_id]
+        else:
+            mask = self.chunk_masks[chunk_id].sum(dim=0).bool()  # 多 chunk 并集
 
-        # 2. 当前 chunk 嵌入 & 处理
-        z = self.chunk_embeds[chunk_id](x)   # (B, len, d_model)
-        z = self.chunk_modules[chunk_id](z, x_extra)  # (B, len, 2*d_model)
+        z_acc   = torch.zeros(batch_size, self.total_sites, 2 * self.d_model, device=device)
+        cnt_acc = torch.zeros(self.total_sites, device=device)
 
-        # 3. 拼回全长度，其余 nan
-        z_full = torch.full((B, self.total_sites, 2 * self.d_model), float('nan'), device=device)
-        z_full[:, s:e] = z                        # (B, L, 2*d_model)
-
-        # 4. 全局卷积只激活带状区
-        out = self.global_out(z_full, mask)       # (B, L, n_alleles-1)
-        
-        # 5. 只返回对应chunk的logits
-        return out[:, torch.where(mask)[0]]    # (B, len, n_alleles-1)
-    
-    @torch.no_grad()
-    def infer(self, x: torch.Tensor,
-              x_extra: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        推理接口：遍历全部 chunk，重叠区特征取平均，再统一过全局卷积
-        x:       (B, L, n_alleles)
-        x_extra: (B, extra_dim)
-        return:  (B, L, n_alleles-1)  softmax 概率
-        """
-        B, L, _ = x.shape
-        device = x.device
-        d_out = 2 * self.d_model          # z 通道数
-
-        # 累加器
-        z_sum = torch.zeros(B, d_out, L, device=device)   # (B, 2*d_model, L)
-        z_cnt = torch.zeros(1, 1, L, device=device)        # (1, 1, L)
-
-        # 1. 遍历所有 chunk，拼回全长度并累加
-        for cid in range(self.n_chunks):
-            mask = self.chunk_masks[cid]          # (L,)  0/1
-            idx  = torch.where(mask)[0]           # 当前 chunk 位点
+        # 1. 依次处理每个cid
+        for cid in chunk_id:
             s, e = self.starts[cid].item(), self.ends[cid].item()
+            x_chunk = x[:, s:e]
+            z = self.chunk_embeds[cid](x_chunk)                    # (B, len, d_model)
+            z = self.chunk_modules[cid](z, x_extra)                # (B, len, 2*d_model)
+            z_acc[:, s:e] += z
+            cnt_acc[s:e]  += 1
 
-            # 与 forward 完全相同：chunk -> z
-            x_slice = x[:, s:e]
-            z = self.chunk_embeds[cid](x_slice)
-            z = self.chunk_modules[cid](z, x_extra)        # (B, len, 2*d_model)
-            z = z.transpose(1, 2)                          # (B, 2*d_model, len)
+        # 2. 重叠平均
+        cnt_acc = cnt_acc.clamp(min=1)
+        z_full  = z_acc / cnt_acc.unsqueeze(0).unsqueeze(-1)     # (B, L, 2*d_model)
 
-            # 写回全长度 & 累加
-            z_sum[..., idx] += z[..., idx - s]             # 局部→全局对齐
-            z_cnt[..., idx] += 1
+        # 3. 全局输出
+        out  = self.global_out(z_full, mask)                     # (B, L, n_alleles-1)
 
-        # 2. 重叠区平均
-        z_full = z_sum / z_cnt.clamp_min(1.0)              # (B, 2*d_model, L)
+        # 4. 返回并集区域
+        # return out[:, torch.where(mask)[0]]
+        return out, torch.where(mask)[0]
 
-        # 3. 统一过全局卷积一次
-        #    global_out 需要 mask：全 1 即可（所有位点都有效）
-        full_mask = torch.ones(L, dtype=torch.float, device=device)
-        return self.global_out(z_full, full_mask)          # (B, L, n_alleles-1)
 
 if __name__ == '__main__':
     # ---------- 假数据 ----------
-    B, L, A = 4, 12345, 3
+    B, L, A = 8, 12345, 3
     d_model = 64
     chunk_size, overlap = 4096, 64
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -559,30 +558,15 @@ if __name__ == '__main__':
     # ---------- 模型 &损失 ----------
     model = EvoFill(d_model, A, L, chunk_size, overlap).to(device)
     print(f"model chunks: {model.n_chunks}")
-    criterion = nn.MSELoss(reduction='mean')
 
-    # ---------- 训练循环 ----------
-    epochs_per_chunk = 3
-    for cid in range(model.n_chunks):
-        mask = model.chunk_masks[cid]
-        idx = torch.where(mask)[0]
-        x_band = x_train[:,idx]
-        y_band = y_train[:,idx]
-        print(f"x_band: {x_band.shape}")
-        print(f"x_extra: {x_extra.shape}")
-        print(f"y_band: {y_band.shape}")
-        opt = torch.optim.AdamW(
-            list(model.chunk_embeds[cid].parameters()) +
-            list(model.chunk_modules[cid].parameters()) +
-            list(model.global_out.parameters()), lr=3e-4)
-        for epoch in range(epochs_per_chunk):
-            opt.zero_grad()
-            pred = model(x_band, cid, x_extra)
+    print("单 chunk 测试")
+    cid = 0
+    model.global_out.set_ulr_enabled(False)
+    pred, mask_idx = model(x_train, cid, x_extra)
+    print(pred.shape)
 
-            loss = criterion(pred, y_band)        # 默认 reduction='mean'
-            loss.backward()
-            opt.step()
-            print("")
-
-            print(f"pred: {pred.shape}")
-            print(f'chunk {cid}/{model.n_chunks-1} | epoch {epoch+1}/{epochs_per_chunk} | loss {loss.item():.4f}')
+    print("多 chunk 测试")
+    cids= [0,2]
+    model.global_out.set_ulr_enabled(True)
+    pred, mask_idx = model(x_train, cid, x_extra)
+    print(pred.shape)
