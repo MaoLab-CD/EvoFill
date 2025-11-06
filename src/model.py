@@ -1,4 +1,4 @@
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -145,56 +145,6 @@ class ConvBlock(nn.Module):
 
         return xa.transpose(1, 2)  # (batch, seq_len, d_model)
 
-class ExtraEmbedding(nn.Module):
-    """
-    输入:  (B, L)        L == extra_dim
-    输出: (B, L, d_model)
-    """
-    def __init__(
-        self,
-        d_model: int,
-        d_state: int = 64,
-        d_conv: int  = 4,
-        expand: int  = 2,
-        headdim: int = 128,
-        ngroups: int = 1,
-        dropout: float = 0.1,
-        **mamba_kwargs,
-    ):
-        super().__init__()
-        self.d_model   = d_model
-
-        # 1. 把 (B, L) 的 1-d 标量升到 d_model
-        self.in_proj = nn.Linear(1, d_model, bias=False)
-
-        # 2. 官方 Mamba2Simple：把 L 当序列长度，建模 L↔L
-        self.mamba = Mamba2Block(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-            headdim=headdim,
-            ngroups=ngroups,
-            **mamba_kwargs
-        )
-
-        # 3. Norm
-        self.norm = nn.LayerNorm(d_model)
-
-
-    def forward(self, x: torch.Tensor):
-        """
-        x: (B, L)  连续值或离散索引
-        """
-        # (B, L) -> (B, L, 1) -> (B, L, d_model)
-        h = self.in_proj(x.unsqueeze(-1).float())   # 1-d 投影
-
-        h = self.norm(h)
-
-        # Mamba2Simple 要求输入 (B, L, d_model) 即可
-        out = self.mamba(h)                           # SSD 全局建模
-        return out
-
 class StackMambaBlock(nn.Module):
     def __init__(
         self,
@@ -204,17 +154,12 @@ class StackMambaBlock(nn.Module):
         expand=2,
         headdim=128,
         ngroups=1,
-        chunk_size=256,
         dropout=0.0,
-        d_embed_dropout=0.0,
         device=None,
         dtype=None,
     ):
         super().__init__()
         self.d_model = d_model
-
-        # 距离矩阵嵌入
-        self.extra_embed = ExtraEmbedding(d_model=d_model, dropout=d_embed_dropout)
 
         # 原归一化
         self.norm1 = nn.LayerNorm(d_model)
@@ -229,7 +174,6 @@ class StackMambaBlock(nn.Module):
             expand=expand,
             headdim=headdim,
             ngroups=ngroups,
-            chunk_size=chunk_size,
             use_mem_eff_path=True,
             device=device,
             dtype=dtype,
@@ -243,24 +187,17 @@ class StackMambaBlock(nn.Module):
             nn.Linear(d_model // 2, d_model),
         )
 
-    def forward(self, local_repr, global_repr, x_extra=None,
+    def forward(self, local_repr, global_repr,
                 start_offset=0, end_offset=0):
         """
         local_repr: (B, L, D)
         global_repr: (B, G, D)
-        x_extra: 可选，(B,E) 
         """
         local_norm  = self.norm1(local_repr)
         global_norm = self.norm2(global_repr)
 
         # 1. 构造输入序列
-        tokens = []
-        if x_extra is not None:
-            extra_token = self.extra_embed(x_extra)        # (B,E,D)
-            tokens.append(extra_token)
-        tokens.append(global_norm)
-        tokens.append(local_norm)
-        x = torch.cat(tokens, dim=1)               # [B, (E)+G+L, D]
+        x = torch.cat([global_norm, local_norm], dim=1) # [B, G+L, D]
 
         # 2. SSD 扫描
         x = self.ssd(x)                            # [B, (E)+G+L, D]
@@ -297,14 +234,8 @@ class ChunkModule(nn.Module):
 
         # Cross attention
         # self.cross_attention = CrossAttentionLayer(d_model, n_heads)
-        self.cross_attention = StackMambaBlock(
+        self.stack_mamba = StackMambaBlock(
             d_model=d_model,
-            d_state=64,
-            d_conv=4,
-            expand=2,
-            headdim=128,
-            ngroups=1,
-            chunk_size=256,
         )
 
         # Additional layers
@@ -312,7 +243,7 @@ class ChunkModule(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
         self.gelu = nn.GELU()
 
-    def forward(self, x, x_extra=None):
+    def forward(self, x):
         # BiMamba processing
         xa0 = self.bimamba_block(x)
 
@@ -325,7 +256,7 @@ class ChunkModule(nn.Module):
         xa = self.conv_block3(xa)
 
         # Cross attention
-        xa = self.cross_attention(xa, xa0, x_extra)
+        xa = self.stack_mamba(xa, xa0)
         xa = self.dropout(xa)
 
         # Final conv block
@@ -338,13 +269,15 @@ class ChunkModule(nn.Module):
 
 class UltraLongRangeMamba(nn.Module):
     """
-    线性复杂度 O(L) 全局建模，只激活 mask=1 的位点
+    线性复杂度 O(M) 全局建模，只激活跨 chunk 且距离 > chunk_size 的位点关系。
+    输出 (B,M,d_model//2)，可直接与 h_local 做门控融合。
     """
-    def __init__(self, d_model, d_state=64, d_conv=4, expand=2,
+    def __init__(self, d_model, chunk_size=8192, total_sites=100_000, threshold=0.1,d_state=64, d_conv=4, expand=2,
                  n_layers=2, dropout=0.1):
         super().__init__()
-        self.d_inner = int(d_model * expand)
-        # 可选：多层 Mamba2
+        self.chunk_size = chunk_size
+        self.threshold  = threshold
+        # ---- Mamba-2 堆叠 ----
         self.layers = nn.ModuleList([
             BiMambaBlock(d_model, d_state=d_state, d_conv=d_conv, expand=expand)
             for _ in range(n_layers)
@@ -352,23 +285,44 @@ class UltraLongRangeMamba(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, idx):
+        # ---- idx 嵌入 ----
+        self.idx_embed = nn.Embedding(total_sites, d_model // 2, sparse=True)
+
+        # ---- 门控 ----
+        self.gate_proj = nn.Sequential(
+            nn.Linear(d_model // 2, d_model // 2),
+            nn.Sigmoid()
+        )
+
+    def forward(self, h_local, idx):
         """
-        x: (B, L_all, d_model)  全局张量，其余位置为 nan
-        idx: (M,)  当前 mask=1 的坐标
-        返回: (B, M, d_model//2)
+        h_local: (B, M, d_model//2)  局部特征
+        idx:     (M,)                在 0~L-1 的坐标
+        return:  (B, M, d_model//2)  已融合长程信号
         """
-        # 只取有效 token
-        x_in = x[:, idx] 
-        x_in = self.dropout(x_in)                                   # (B, M, D)
+        # 1. 构造输入：坐标嵌入 + 局部特征
+        idx_emb = self.idx_embed(idx).unsqueeze(0).expand(h_local.shape[0], -1, -1)                  # (B,M,D//2)
+        x = torch.cat([idx_emb,h_local], dim=-1)       # (B,M,D)
+
+        # 2. Mamba 全局编码（只激活 M 个位点，O(M)）
+        x = self.dropout(x)
         for layer in self.layers:
-            x_in = layer(x_in)                              # BiMamba2
-        return self.norm(x_in)
+            x = layer(x)
+        x = self.norm(x)
+        h_global = x[..., x.size(-1)//2:]               # 取后半截 (B,M,D//2)
+
+        # 3. 门控 + 阈值过滤
+        delta = h_global - h_local
+        gate = self.gate_proj(delta)
+        # 4. 硬阈值 mask：delta 太小就把 gate 置 0
+        mask = (delta.abs() > self.threshold)      # (B,M,D//2)  逐元素
+        gate = gate * mask                         # 不满足→ gate=0
+        fused = h_local + gate * delta             # gate=0 时 fused=h_local
+        return fused
 
 class GlobalOut(nn.Module):
     def __init__(self, d_model, n_alleles, total_sites, chunk_size,
-                 kernel=5, pad=2, stripe=4096,
-                 d_state=64, d_conv=4, expand=2, n_mamba_layers=2):
+                 kernel=5, pad=2, stripe=4096):
         super().__init__()
         self.k, self.p = kernel, pad
         self.stripe = stripe
@@ -387,14 +341,10 @@ class GlobalOut(nn.Module):
 
         # -------------- 2) ulr 中间件（Mamba2） --------------
         self.ulr_mamba = UltraLongRangeMamba(
-            d_model=d_model//2,          # 与 Conv1 输出同维
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-            n_layers=n_mamba_layers,
-        )
-        self.gate = nn.Linear(d_model, 2)   # [local; global] -> 2
-        self.norm = nn.LayerNorm(d_model // 2)
+            d_model=d_model,
+            chunk_size=chunk_size,
+            total_sites = total_sites,
+            threshold=0.05)
 
         # -------------- 3) 开关 --------------
         self.skip_ulr = True
@@ -404,8 +354,6 @@ class GlobalOut(nn.Module):
     def set_ulr_enabled(self, enabled: bool):
         self.skip_ulr = not enabled
         for p in self.ulr_mamba.parameters():
-            p.requires_grad = enabled
-        for p in self.gate.parameters():
             p.requires_grad = enabled
 
     # ============ 前向：ulr 是可插拔中间件 ============
@@ -438,16 +386,13 @@ class GlobalOut(nn.Module):
             fused = h_local
         else:
             # 第二阶段：Mamba2 全局建模并融合
-            h_global = self.ulr_mamba(h_local, idx)           # (B, M, d_model//2)
-            gate_in = torch.cat([h_local, h_global], dim=-1)  # (B, M, d_model)
-            w = torch.softmax(self.gate(gate_in), dim=-1)     # (B, M, 2)
-            fused = w[..., 0:1] * h_local + w[..., 1:2] * h_global
-            fused = self.norm(fused)                          # (B, M, d_model//2)
+            fused = self.ulr_mamba(h_local, idx)                 # (B, M, d_model//2)
 
         # ---- 3) 统一走 Conv2：d_model//2 -> n_alleles-1 ----
         y_final = F.conv1d(fused.transpose(1, 2), self.w2, self.b2, padding=self.p)
         out[..., idx] = y_final
-        return F.softmax(out.transpose(1, 2), dim=-1)
+
+        return out.transpose(1, 2)
 
     # ---------- 辅助 ----------
     def _band_conv1(self, x, w, b):
@@ -499,13 +444,10 @@ class EvoFill(nn.Module):
     def forward(self,
             x: torch.Tensor,                 # (B, L, n_alleles) one-hot
             chunk_id: Union[int, List[int]],
-            x_extra: Optional[torch.Tensor] = None
             ):
 
         batch_size = x.shape[0]
         device = x.device
-        if x_extra is not None and x_extra.shape[0] != batch_size:
-            x_extra = None
 
         # 统一成 list
         if isinstance(chunk_id, int):
@@ -522,7 +464,7 @@ class EvoFill(nn.Module):
             s, e = self.starts[cid].item(), self.ends[cid].item()
             x_chunk = x[:, s:e]
             z = self.chunk_embeds[cid](x_chunk)                    # (B, len, d_model)
-            z = self.chunk_modules[cid](z, x_extra)                # (B, len, 2*d_model)
+            z = self.chunk_modules[cid](z)                # (B, len, 2*d_model)
             z_acc[:, s:e] += z
             cnt_acc[s:e]  += 1
 
@@ -531,28 +473,29 @@ class EvoFill(nn.Module):
         z_full  = z_acc / cnt_acc.unsqueeze(0).unsqueeze(-1)     # (B, L, 2*d_model)
 
         # 3. 全局输出
-        out  = self.global_out(z_full, mask)                     # (B, L, n_alleles-1)
+        logits  = self.global_out(z_full, mask)                     # (B, L, n_alleles-1)
 
         # 4. 返回并集区域
-        # return out[:, torch.where(mask)[0]]
-        return out, torch.where(mask)[0]
+        prob = F.softmax(logits, dim=-1)
+
+        return logits, prob, torch.where(mask)[0]
 
 
 if __name__ == '__main__':
     # ---------- 假数据 ----------
-    B, L, A = 8, 12345, 3
+    B, L, A = 8, 1000000, 3
     d_model = 64
-    chunk_size, overlap = 4096, 64
+    chunk_size, overlap = 65536, 1024
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     x_train = torch.zeros(B, L, A, device=device)
     allele = torch.randint(0, A, (B, L), device=device)
     x_train.scatter_(2, allele.unsqueeze(-1), 1)
-    x_extra = torch.randn(B, 10, device=device)
+    # x_extra = torch.randn(B, 10, device=device)
     y_train = torch.randn(B, L, A-1, device=device)
 
     print(f"x_train: {x_train.shape}")
-    print(f"x_extra: {x_extra.shape}")
+    # print(f"x_extra: {x_extra.shape}")
     print(f"y_train: {y_train.shape}")
     print("")
     # ---------- 模型 &损失 ----------
@@ -562,11 +505,11 @@ if __name__ == '__main__':
     print("单 chunk 测试")
     cid = 0
     model.global_out.set_ulr_enabled(False)
-    pred, mask_idx = model(x_train, cid, x_extra)
-    print(pred.shape)
+    logits, prob, mask_idx = model(x_train, cid)
+    print(prob.shape)
 
     print("多 chunk 测试")
     cids= [0,2]
     model.global_out.set_ulr_enabled(True)
-    pred, mask_idx = model(x_train, cid, x_extra)
-    print(pred.shape)
+    logits, prob, mask_idx = model(x_train, cid)
+    print(prob.shape)

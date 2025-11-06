@@ -13,14 +13,14 @@ class GenotypeEncoder:
     def __init__(self,
                  save_dir: str,
                  vcf_path: str,
-                 ref_extra: Optional[str] = None,
+                 evo_mat: Optional[str] = None,
                  phased: bool = True,
                  gts012: bool = False):
         self.save_dir = save_dir
-        self.vcf_path    = vcf_path
-        self.ref_extra   = ref_extra
-        self.phased      = phased if ref_extra is None else False # 是否把样本拆成单倍型
-        self.gts012      = gts012
+        self.vcf_path = vcf_path
+        self.evo_mat_path  = evo_mat
+        self.phased   = phased if evo_mat is None else False # 是否把样本拆成单倍型
+        self.gts012   = gts012
         
         # 其余成员先占位
         self.hap_map = {}
@@ -28,24 +28,21 @@ class GenotypeEncoder:
         self.n_variants  = 0
         self.sample_ids  = []   # 后面读 VCF 时填充
         self.variant_ids = []
-
-        self.X_gt        = None   # 最终返回的张量
-        self.X_extra     = None   # extra 信息
         self.seq_depth   = None
 
         # 1) 读 VCF
         self.X_gt = self.load_gt()
-        # 2) 读 extra
-        self.X_extra = self.load_extra() if self.ref_extra else None
+        # 2) 读 evo_mat
+        self.evo_mat = self.load_evo_mat() if self.evo_mat_path else None
         # 3) 保存 meta
         self.save_meta()
 
     def add_hap_map(self, key, val):
         if key in self.hap_map:
-            if self.hap_map[key] != int(val):
+            if self.hap_map[key] != str(val):
                 raise(f"[DATA] hap_map[{key}] inconsistent")
         else:
-            self.hap_map[key] = int(val)
+            self.hap_map[key] = str(val)
 
     def encode_gt(self, rec, n_samples, phase=False, gts012=True):
         """
@@ -107,14 +104,15 @@ class GenotypeEncoder:
                 self.add_hap_map(a1+phase+a2, out[i])
             return out
 
-    def load_extra(self) -> Optional[np.ndarray]:
+    def load_evo_mat(self) -> Optional[np.ndarray]:
         try:
-            df = pd.read_csv(self.ref_extra, sep='\t', index_col=0)
-            df = df.loc[self.sample_ids]          # 保证与 VCF 样本顺序一致
-            print(f"[DATA] Extra dims: {df.shape}")
+            df = pd.read_csv(self.evo_mat_path, sep='\t', index_col=0)
+            df = df.loc[self.sample_ids,self.sample_ids] # 保证与 VCF 样本顺序一致
+            np.fill_diagonal(df.values, 0)
+            print(f"[DATA] EvoMat shape: {df.shape}")
             return df.values.astype(np.float32)
         except Exception as e:
-            print(f"[DATA] Extra features skipped: {e}")
+            print(f"[DATA] EvoMat skipped: {e}")
             return None
 
     def load_gt(self):
@@ -197,7 +195,7 @@ class GenotypeEncoder:
             return obj
         meta = {
             "vcf_path"   : str(self.vcf_path),
-            "ref_extra"  : str(self.ref_extra),
+            "evo_mat"    : str(self.evo_mat),
             "phased"     : str(self.phased),
             "gts012"     : str(self.gts012),
             "n_samples"  : str(self.n_samples),
@@ -208,9 +206,9 @@ class GenotypeEncoder:
         with open(os.path.join(self.save_dir, "gt_enc_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
-        # 如果 X_extra 不是 None，也可以落盘
-        if self.X_extra is not None:
-            np.save(os.path.join(self.save_dir, "gt_extra.npy"), self.X_extra)
+        # 如果 evo_mat 不是 None，也落盘
+        if self.evo_mat is not None:
+            np.save(os.path.join(self.save_dir, "evo_mat.npy"), self.evo_mat)
 
     @classmethod
     def loadfromdisk(cls, work_dir: str):
@@ -232,7 +230,7 @@ class GenotypeEncoder:
         #    把关键字段先填进去，避免 __init__ 里再去读 VCF
         obj = cls.__new__(cls)  # 不调用 __init__
         obj.vcf_path    = meta["vcf_path"]
-        obj.ref_extra   = meta["ref_extra"]
+        obj.evo_mat     = meta["evo_mat"]
         obj.phased      = bool(meta["phased"])
         obj.gts012      = bool(meta["gts012"])
         obj.n_samples   = int(meta["n_samples"])
@@ -252,25 +250,25 @@ class GenotypeEncoder:
         obj.X_gt = sp.load_npz(os.path.join(work_dir, "gt_matrix.npz"))
 
         # 5. 读 extra（如果有）
-        extra_path = os.path.join(work_dir, "gt_extra.npy")
-        if os.path.exists(extra_path):
-            obj.X_extra = np.load(extra_path)
+        evo_mat_path = os.path.join(work_dir, "evo_mat.npy")
+        if os.path.exists(evo_mat_path):
+            obj.evo_mat = np.load(evo_mat_path)
         else:
-            obj.X_extra = None
+            obj.evo_mat = None
 
         return obj
 
 class GenomicDataset(Dataset):
     """Dataset class for genomic data with masking for training"""
-    def __init__(self, x_gts_sparse, x_extra=None, seq_depth=4,
+    def __init__(self, x_gts_sparse, evo_mat=None, seq_depth=4,
                  mask=True, masking_rates=(0.5, 0.99), indices=None):
         """
         x_gts_sparse: scipy.sparse.csr_matrix or similar
-        x_extra: numpy array or None
+        evo_mat: numpy array or None
         indices: 可选，指定要使用的样本索引（如 train/valid 索引）
         """
         self.gts_sparse = x_gts_sparse
-        self.x_extra = x_extra
+        self.evo_mat = evo_mat
         self.seq_depth = seq_depth
         self.mask = mask
         self.masking_rates = masking_rates
@@ -294,13 +292,7 @@ class GenomicDataset(Dataset):
         x_onehot = torch.FloatTensor(np.eye(self.seq_depth)[x])
         y_onehot = torch.FloatTensor(np.eye(self.seq_depth - 1)[y])
 
-        if self.x_extra is not None:
-            x_extra = torch.FloatTensor(self.x_extra[real_idx])
-        else:
-            x_extra = torch.empty(0)
-
-        return x_onehot, x_extra, y_onehot
-
+        return x_onehot, y_onehot, real_idx
 
 class ImputationDataset(Dataset):
     """Dataset for imputation (no masking needed)"""

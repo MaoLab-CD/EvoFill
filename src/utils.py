@@ -104,6 +104,9 @@ def build_geno3_map_from_hapmap(hap_map: dict) -> np.ndarray:
             three_class.append(2)
     return np.array(three_class, dtype=np.int64)
 
+# ---------- 2. 线程安全缓存 ----------
+MAF_BINS = [(0.00, 0.05), (0.05, 0.10), (0.10, 0.20),
+            (0.20, 0.30), (0.30, 0.40), (0.40, 0.50)]
 _GENO3_CACHE: Dict[int, torch.Tensor] = {}
 _GENO3_LOCK = torch.multiprocessing.Lock()
 
@@ -164,8 +167,7 @@ def _compute_site_metrics(prob3: torch.Tensor,
     mean_pred = (pred_dosage * mask).sum(0) / n_valid.clamp(min=1)
 
     # 分子：协方差（= 预测对真实解释的方差）
-    num = ((pred_dosage - mean_pred.unsqueeze(0)) *
-           (true_dosage - mean_true.unsqueeze(0)) * mask).sum(0) / n_valid.clamp(min=1)
+    num = ((pred_dosage - mean_pred.unsqueeze(0)).square() * mask).sum(0) / n_valid.clamp(min=1)
 
     # 分母：由真实剂量得到的 AF*(1-AF)
     AF = mean_true / 2.0
@@ -196,7 +198,7 @@ def _compute_site_metrics(prob3: torch.Tensor,
 # ---------- 5. 唯一对外接口 ----------
 def metrics_by_maf(prob: torch.Tensor,
                    y_true: torch.Tensor,
-                   hap_map,
+                   hap_map : Dict,
                    maf_vec: torch.Tensor,
                    bins: List[Tuple[float, float]] = MAF_BINS,
                    mask: Optional[torch.Tensor] = None
