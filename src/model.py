@@ -346,15 +346,15 @@ class GlobalOut(nn.Module):
             total_sites = total_sites,
             threshold=0.05)
 
-        # -------------- 3) 开关 --------------
-        self.skip_ulr = True
-        self.set_ulr_enabled(False)
+    #     # -------------- 3) 开关 --------------
+    #     self.skip_ulr = True
+    #     self.set_ulr_enabled(False)
 
-    # ============ 两阶段切换 ============
-    def set_ulr_enabled(self, enabled: bool):
-        self.skip_ulr = not enabled
-        for p in self.ulr_mamba.parameters():
-            p.requires_grad = enabled
+    # # ============ 两阶段切换 ============
+    # def set_ulr_enabled(self, enabled: bool):
+    #     self.skip_ulr = not enabled
+    #     for p in self.ulr_mamba.parameters():
+    #         p.requires_grad = enabled
 
     # ============ 前向：ulr 是可插拔中间件 ============
     def forward(self, x, mask):
@@ -380,13 +380,13 @@ class GlobalOut(nn.Module):
             y1 = checkpoint(self._band_conv1, x_i, self.w1, self.b1, use_reentrant=False)
             h_local.append(y1)
         h_local = torch.cat(h_local, dim=2).transpose(1, 2)  # (B, M, d_model//2)
-        # ---- 2) ulr 中间件（可选） ----
-        if self.skip_ulr:
-            # 第一阶段：不做任何全局事，h_local 保持原样
-            fused = h_local
-        else:
-            # 第二阶段：Mamba2 全局建模并融合
-            fused = self.ulr_mamba(h_local, idx)                 # (B, M, d_model//2)
+        # # ---- 2) ulr 中间件（可选） ----
+        # if self.skip_ulr:
+        #     # 第一阶段：不做任何全局事，h_local 保持原样
+        #     fused = h_local
+        # else:
+        # 第二阶段：Mamba2 全局建模并融合
+        fused = self.ulr_mamba(h_local, idx)                 # (B, M, d_model//2)
 
         # ---- 3) 统一走 Conv2：d_model//2 -> n_alleles-1 ----
         y_final = F.conv1d(fused.transpose(1, 2), self.w2, self.b2, padding=self.p)
@@ -443,18 +443,17 @@ class EvoFill(nn.Module):
 
     def forward(self,
             x: torch.Tensor,                 # (B, L, n_alleles) one-hot
-            chunk_id: Union[int, List[int]],
+            chunk_id: Optional[Union[int, List[int]]] = None
             ):
 
         batch_size = x.shape[0]
         device = x.device
-
+        if chunk_id is None:
+            chunk_id = list(range(self.n_chunks))
         # 统一成 list
         if isinstance(chunk_id, int):
-            mask = self.chunk_masks[chunk_id].bool()          # 单 chunk
             chunk_id = [chunk_id]
-        else:
-            mask = self.chunk_masks[chunk_id].sum(dim=0).bool()  # 多 chunk 并集
+        mask = self.chunk_masks[chunk_id].sum(dim=0).bool()  # 并集掩码
 
         z_acc   = torch.zeros(batch_size, self.total_sites, 2 * self.d_model, device=device)
         cnt_acc = torch.zeros(self.total_sites, device=device)

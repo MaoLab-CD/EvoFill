@@ -107,10 +107,10 @@ def build_geno3_map_from_hapmap(hap_map: dict) -> np.ndarray:
 # ---------- 2. 线程安全缓存 ----------
 MAF_BINS = [(0.00, 0.05), (0.05, 0.10), (0.10, 0.20),
             (0.20, 0.30), (0.30, 0.40), (0.40, 0.50)]
-_GENO3_CACHE: Dict[int, torch.Tensor] = {}
+_GENO3_CACHE: Dict[int, np.ndarray] = {}
 _GENO3_LOCK = torch.multiprocessing.Lock()
 
-def get_geno3_map_tensor(C_orig: int, hap_map, device: torch.device) -> torch.Tensor:
+def get_geno3_map(C_orig: int, hap_map) -> np.ndarray:
     key = int(C_orig)
     with _GENO3_LOCK:
         t = _GENO3_CACHE.get(key)
@@ -118,88 +118,76 @@ def get_geno3_map_tensor(C_orig: int, hap_map, device: torch.device) -> torch.Te
             arr = build_geno3_map_from_hapmap(hap_map)  # 假设 gt_enc 已全局可见
             if arr.shape[0] != C_orig:
                 raise RuntimeError(f"三分类映射长度{arr.shape[0]}与类别数{C_orig}不符")
-            t = torch.from_numpy(arr)
+            t = arr
             _GENO3_CACHE[key] = t
-    return t.to(device)
+    return t
 
 # ---------- 3. 三分类聚合 ----------
-def aggregate_three_classes(prob: torch.Tensor, y_true: torch.Tensor, hap_map) -> Tuple[torch.Tensor, torch.Tensor]:
-    N, L, C = prob.shape
-    device = prob.device
-    gmap = get_geno3_map_tensor(C,hap_map, device)
-    W = torch.zeros(C, 3, device=device)
-    W[torch.arange(C, device=device), gmap.long()] = 1.0
-    prob3 = torch.einsum('nlc,ck->nlk', prob, W)
-    y3    = torch.einsum('nlc,ck->nlk', y_true, W)
-    prob3 = prob3 / prob3.sum(-1, keepdim=True).clamp(min=1e-8)
+def aggregate_three_classes(prob: np.ndarray, y_true: np.ndarray, hap_map) -> Tuple[np.ndarray, np.ndarray]:
+    _, _, C = prob.shape
+    gmap = get_geno3_map(C,hap_map, )
+    W = np.zeros((C, 3), dtype=prob.dtype)
+    W[np.arange(C), gmap] = 1.0
+    prob3 = prob @ W
+    y3    = y_true @ W
+    prob3 = prob3 / prob3.sum(-1, keepdims=True).clip(min=1e-8)
     return prob3, y3
 
 # ---------- 4. 向量化计算 3 个指标 ----------
-def _compute_site_metrics(prob3: torch.Tensor,
-                          y3: torch.Tensor,
-                          mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _compute_site_metrics(prob3: np.ndarray,
+                          y3: np.ndarray,
+                          mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     一次性返回 (INFO, MaCH-Rsq, IQS) 三个 (L,) 向量
     prob3/y3: (N,L,3)  mask: (N,L)
     """
-    # dosage / W / p_alt
-    p_ref, p_het, p_hom = prob3.unbind(-1)
-    dosage = p_het + 2*p_hom
-    W_score = p_het + 4*p_hom
+    p_ref, p_het, p_hom = prob3[..., 0], prob3[..., 1], prob3[..., 2]
+    dosage  = p_het + 2 * p_hom
+    W_score = p_het + 4 * p_hom
 
-    # 按位点求平均
-    n_valid = mask.sum(0)                        # (L,)
-    AF = 0.5 * (dosage * mask).sum(0) / n_valid.clamp(min=1)
+    n_valid = mask.sum(axis=0)                  # (L,)
+    AF = 0.5 * (dosage * mask).sum(axis=0) / n_valid.clip(min=1)
     denom_info = AF * (1 - AF)
 
-    # INFO
-    var_want = ((W_score - dosage.square()) * mask).sum(0) / n_valid.clamp(min=1)
-    info = 1 - 0.5 * var_want / denom_info.clamp(min=1e-8)
-    info = info.clamp(0, 1)
+    var_want = ((W_score - dosage ** 2) * mask).sum(axis=0) / n_valid.clip(min=1)
+    info = 1 - 0.5 * var_want / denom_info.clip(min=1e-8)
+    info = info.clip(0, 1)
 
-    # MaCH-Rsq
-    # 真实剂量
-    true_dosage = (y3[..., 1] + 2*y3[..., 2]).float()        # (N,L)
-    # 预测剂量
-    pred_dosage = dosage                                       # (N,L) 前面已算好
-    # 有效样本均值
-    mean_true = (true_dosage * mask).sum(0) / n_valid.clamp(min=1)
-    mean_pred = (pred_dosage * mask).sum(0) / n_valid.clamp(min=1)
+    # MaCH
+    true_dos = y3[..., 1] + 2 * y3[..., 2]
+    pred_dos = dosage
+    mean_true = (true_dos * mask).sum(axis=0) / n_valid.clip(min=1)
+    mean_pred = (pred_dos * mask).sum(axis=0) / n_valid.clip(min=1)
 
-    # 分子：协方差（= 预测对真实解释的方差）
-    num = ((pred_dosage - mean_pred.unsqueeze(0)).square() * mask).sum(0) / n_valid.clamp(min=1)
+    num = ((pred_dos - mean_pred) ** 2 * mask).sum(axis=0) / n_valid.clip(min=1)
+    AF2 = mean_true / 2.0
+    denom = AF2 * (1 - AF2)
+    mach = num / denom.clip(min=1e-8)
+    mach = mach.clip(0, 1)
 
-    # 分母：由真实剂量得到的 AF*(1-AF)
-    AF = mean_true / 2.0
-    denom = AF * (1 - AF)
-    mach = num / denom.clamp(min=1e-8)
-    mach = mach.clamp(0, 1)
-
-    # IQS (Cohen's kappa)
-    pred_cls = prob3.argmax(-1)                  # (N,L)
-    true_cls = y3.argmax(-1)
-    agree = (pred_cls == true_cls) & mask        # (N,L)
-    Po = (agree.sum(0)).float() / n_valid.clamp(min=1)
-    Pe = torch.zeros_like(Po)
+    # IQS
+    pred_cls = prob3.argmax(axis=-1)
+    true_cls = y3.argmax(axis=-1)
+    agree = (pred_cls == true_cls) & mask
+    Po = agree.sum(axis=0).astype(float) / n_valid.clip(min=1)
+    Pe = np.zeros_like(Po)
     for c in range(3):
-        p_c = ((pred_cls == c) & mask).sum(0).float() / n_valid.clamp(min=1)
-        t_c = ((true_cls == c) & mask).sum(0).float() / n_valid.clamp(min=1)
+        p_c = ((pred_cls == c) & mask).sum(axis=0).astype(float) / n_valid.clip(min=1)
+        t_c = ((true_cls == c) & mask).sum(axis=0).astype(float) / n_valid.clip(min=1)
         Pe += p_c * t_c
-    iqs = (Po - Pe) / (1 - Pe).clamp(min=1e-8)
-    iqs = iqs.clamp(-1, 1)
+    iqs = (Po - Pe) / (1 - Pe).clip(min=1e-8)
+    iqs = iqs.clip(-1, 1)
 
     # 无效位点填 0
     invalid = n_valid == 0
-    info[invalid] = 0
-    mach[invalid] = 0
-    iqs[invalid]  = 0
+    info[invalid] = mach[invalid] = iqs[invalid] = 0
     return info, mach, iqs
 
 # ---------- 5. 唯一对外接口 ----------
 def metrics_by_maf(prob: torch.Tensor,
                    y_true: torch.Tensor,
                    hap_map : Dict,
-                   maf_vec: torch.Tensor,
+                   maf_vec: np.ndarray,
                    bins: List[Tuple[float, float]] = MAF_BINS,
                    mask: Optional[torch.Tensor] = None
                    ) -> Dict[str, List[float]]:
@@ -207,37 +195,39 @@ def metrics_by_maf(prob: torch.Tensor,
     返回 dict: {'Acc':[...], 'INFO':[...], 'MaCH':[...], 'IQS':[...]}
     顺序与 bins 一致
     """
-    N, L, _ = prob.shape
-    device = prob.device
-    if mask is None:
-        mask = torch.ones((N, L), dtype=torch.bool, device=device)
-
-    # 三分类
-    prob3, y3 = aggregate_three_classes(prob, y_true, hap_map)
-
-    # --- 5.1 accuracy 向量化 ---
-    preds = prob3.argmax(-1)
-    gts   = y3.argmax(-1)
-    correct = (preds == gts) & mask                      # (N,L)
-    maf_b = maf_vec.unsqueeze(0)                         # (1,L)
-    acc_bins = []
-    for lo, hi in bins:
-        mbin = mask & (maf_b >= lo) & (maf_b < hi)
-        n_cor = (correct & mbin).sum()
-        n_tot = mbin.sum()
-        acc_bins.append((n_cor / n_tot).item() if n_tot > 0 else 0.)
-
-    # --- 5.2 其余 3 个指标 ---
-    info_all, mach_all, iqs_all = _compute_site_metrics(prob3, y3, mask)
-    info_bins, mach_bins, iqs_bins = [], [], []
-    for lo, hi in bins:
-        idx = (maf_vec >= lo) & (maf_vec < hi)
-        if idx.sum() == 0:
-            info_bins.append(0.); mach_bins.append(0.); iqs_bins.append(0.)
+    with torch.no_grad():
+        prob   = prob.cpu().numpy()
+        y_true = y_true.cpu().numpy()
+        if mask is None:
+            mask = np.ones(prob.shape[:2], dtype=bool)
         else:
-            info_bins.append(info_all[idx].mean().item())
-            mach_bins.append(mach_all[idx].mean().item())
-            iqs_bins.append(iqs_all[idx].mean().item())
+            mask = mask.cpu().numpy().astype(bool)
+
+        # 三分类
+        prob3, y3 = aggregate_three_classes(prob, y_true, hap_map)
+
+        # --- 5.1 accuracy 向量化 ---
+        preds = prob3.argmax(-1)
+        gts   = y3.argmax(-1)
+        correct = (preds == gts) & mask                      # (N,L)
+        acc_bins = []
+        for lo, hi in bins:
+            mbin = mask & (maf_vec >= lo) & (maf_vec < hi)
+            n_cor = np.count_nonzero(correct & mbin)
+            n_tot = np.count_nonzero(mbin)
+            acc_bins.append(n_cor / n_tot if n_tot > 0 else 0.)
+
+        # --- 5.2 其余 3 个指标 ---
+        info_all, mach_all, iqs_all = _compute_site_metrics(prob3, y3, mask)
+        info_bins, mach_bins, iqs_bins = [], [], []
+        for lo, hi in bins:
+            idx = (maf_vec >= lo) & (maf_vec < hi)
+            if idx.sum() == 0:
+                info_bins.append(0.); mach_bins.append(0.); iqs_bins.append(0.)
+            else:
+                info_bins.append(float(info_all[idx].mean()))
+                mach_bins.append(float(mach_all[idx].mean()))
+                iqs_bins.append(float(iqs_all[idx].mean()))
 
     return {'Acc': acc_bins, 'INFO': info_bins,
             'MaCH': mach_bins, 'IQS': iqs_bins}
