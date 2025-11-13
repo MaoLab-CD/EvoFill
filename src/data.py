@@ -11,14 +11,15 @@ from torch.utils.data import Dataset
 
 class GenotypeEncoder:
     # ========= 1. 初始化 =========
-    def __init__(self,
-                 save_dir: str,
+    def __init__(self,  
                  phased: bool = True,
-                 gts012: bool = False):
-        self.save_dir = save_dir
+                 gts012: bool = False,
+                 save2disk: bool = False,
+                 save_dir: Optional[str] = None):
         self.gts012 = gts012
         self.phased = phased
-
+        self.save2disk = save2disk
+        self.save_dir = save_dir
         # 其余占位
         self.hap_map: Dict[str, int] = {}
         self.seq_depth: Optional[int] = None
@@ -41,7 +42,22 @@ class GenotypeEncoder:
         # 真正干活
         self.X_gt = self._load_gt()
         self.evo_mat = self._load_evo_mat() if self.evo_mat_path else None
-        self._save_meta()
+
+        if self.gts012:
+            self.seq_depth = self.X_gt.data.max() + 1
+        else:
+            self.seq_depth = self.X_gt.data.max() + 2
+            self.X_gt.data[self.X_gt.data == -1] = self.seq_depth - 1
+            self.hap_map = {k: int(self.seq_depth - 1) if '.' in str(k) else v for k, v in self.hap_map.items()}
+
+        if self.save2disk:
+            if self.save_dir:
+                self._save_meta()
+            else:
+                print("[DATA] save_dir is not given")
+        
+        print(f'[DATA] 位点矩阵 = {self.X_gt.shape}，稀疏度 = {self.X_gt.nnz / self.X_gt.shape[0] / self.X_gt.shape[1]:.2%}')
+        print(f'[DATA] 位点字典 = {self.hap_map}，字典深度 = {self.seq_depth}')
         return self
 
     # ========= 3. 参照编码：必须 100 % 一致 =========
@@ -69,53 +85,69 @@ class GenotypeEncoder:
         self.evo_mat_path = evo_mat
         self.evo_mat = self._load_evo_mat() if self.evo_mat_path else None
 
-        self._save_meta()
+        if self.save2disk:
+            if self.save_dir:
+                self._save_meta()
+            else:
+                print("[DATA] save_dir is not given")
+        
+        miss_rate = np.sum((self.X_gt.data == self.seq_depth - 1)) 
+        print(f'[DATA] 位点矩阵 = {self.X_gt.shape}，稀疏度 = {self.X_gt.nnz / self.X_gt.shape[0] / self.X_gt.shape[1]:.2%}，缺失率 = {miss_rate / self.X_gt.shape[0] / self.X_gt.shape[1]:.2%}')
+        print(f'[DATA] 位点字典 = {self.hap_map}，字典深度 = {self.seq_depth}')
         return self
 
     # ========= 4. 内部工具：encode_gt 仅增加“参照模式”判断 =========
-    def _encode_gt(self, rec, n_samples, phase=False, gts012=True):
+    def _encode_gt(self, rec, n_samples, phase=False, gts012=False):
         """参照模式下遇到新等位基因直接抛异常"""
         n = n_samples
         ref_mode = bool(self.hap_map) and self.seq_depth is not None
 
-        if phase:
+        if phase: # 基因型模式
             out = np.empty(2 * n, dtype=np.int8)
             for i, gt in enumerate(rec.genotypes):
                 a1, a2, _phased = gt
                 for j, a in enumerate((a1, a2)):
-                    orig = '.' if a is None else str(a)
+                    key = '.' if a == -1 else str(a)
                     idx = 2 * i + j
-                    if a is None:
-                        code = 3 if gts012 else -1
+                    if a == -1:
+                        if ref_mode:
+                            code = self.seq_depth - 1
+                        else:
+                            code = 3 if gts012 else -1
                     else:
                         code = (0 if a == 0 else (2 if a >= 2 else 1)) if gts012 else a
                     if ref_mode:
-                        if orig not in self.hap_map:
+                        if key not in self.hap_map:
                             raise ValueError(
-                                f"[encode_ref] New allele '{orig}' at {rec.CHROM}:{rec.POS} "
+                                f"[encode_ref] New allele '{key}' at {rec.CHROM}:{rec.POS} "
                                 "not in reference hap_map."
                             )
-                        if self.hap_map[orig] != code:
+                        if self.hap_map[key] != code:
                             raise ValueError(
-                                f"[encode_ref] Allele '{orig}' code mismatch: "
-                                f"ref={self.hap_map[orig]} vs current={code}"
+                                f"[encode_ref] Allele '{key}' code mismatch: "
+                                f"ref={self.hap_map[key]} vs current={code}"
                             )
                     else:
-                        self.hap_map[orig] = code
+                        self.hap_map[key] = code
                     out[idx] = code
+            if not ref_mode:
+                self.hap_map['.'] = 3 if gts012 else -1
             return out
-        else:
+        else: # 剂量模式
             out = np.empty(n, dtype=np.int8)
             for i, gt in enumerate(rec.genotypes):
                 a1, a2, _phased = gt
                 sep = '|' if _phased else '/'
-                if a1 is None or a2 is None:
-                    code = 3 if gts012 else -1
-                    key = '.'
+                if a1 == -1 or a2 == -1:
+                    key = sep.join(sorted(['.', '.']))
+                    if ref_mode:
+                        code = self.seq_depth - 1
+                    else:
+                        code = 3 if gts012 else -1
                 else:
                     code = (1 if a1 > 0 else 0) + (1 if a2 > 0 else 0) if gts012 else \
                            (0 if a1 == 0 else a1) + (0 if a2 == 0 else a2)
-                    a1s, a2s = ('.' if x is None else str(x) for x in (a1, a2))
+                    a1s, a2s = ('.' if x == -1 else str(x) for x in (a1, a2))
                     key = sep.join(sorted([a1s, a2s]))
                 if ref_mode:
                     if key not in self.hap_map:
@@ -131,6 +163,8 @@ class GenotypeEncoder:
                 else:
                     self.hap_map[key] = code
                 out[i] = code
+            if not ref_mode:
+                self.hap_map[sep.join(sorted(['.', '.']))] = 3 if gts012 else -1
             return out
 
     # ========= 5. 内部方法 =========
@@ -158,14 +192,6 @@ class GenotypeEncoder:
 
         n_rows = 2 * self.n_samples if self.phased else self.n_samples
         M = sp.csc_matrix((data, cols, indptr), shape=(n_rows, self.n_variants), dtype=np.int8)
-
-        if self.gts012:
-            self.seq_depth = M.data.max() + 1
-        else:
-            self.seq_depth = M.data.max() + 2
-            M.data[M.data == -1] = self.seq_depth - 1
-            self.hap_map = {k: self.seq_depth - 1 if '.' in str(k) else v for k, v in self.hap_map.items()}
-        print(f'[DATA] 位点矩阵 = {M.shape}，稀疏度 = {M.nnz / M.shape[0] / M.shape[1]:.2%}')
         return M
 
     def _load_evo_mat(self):

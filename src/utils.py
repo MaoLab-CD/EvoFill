@@ -40,11 +40,14 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def create_directories(save_dir, models_dir="models", outputs="out") -> None:
+def create_directories(save_dir, ) -> None:
     """Create necessary directories"""
-    for dd in [save_dir, f"{save_dir}/{models_dir}", f"{save_dir}/{outputs}"]:
-        if not os.path.exists(dd):
-            os.makedirs(dd)
+    sub_dir = ["models", "pre_train", "urp_finetune", "impute_in", "impute_out"]
+    if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+    for dd in sub_dir:
+        if not os.path.exists(f"{save_dir}/{dd}"):
+            os.makedirs(f"{save_dir}/{dd}")
 
 def clear_dir(path) -> None:
     """Clear directory if it exists"""
@@ -196,12 +199,16 @@ def metrics_by_maf(prob: torch.Tensor,
     顺序与 bins 一致
     """
     with torch.no_grad():
-        prob   = prob.cpu().numpy()
-        y_true = y_true.cpu().numpy()
+        if isinstance(prob, torch.Tensor):
+            prob = prob.cpu().numpy()
+        if isinstance(y_true, torch.Tensor):
+            y_true = y_true.cpu().numpy()
         if mask is None:
             mask = np.ones(prob.shape[:2], dtype=bool)
         else:
-            mask = mask.cpu().numpy().astype(bool)
+            if isinstance(mask, torch.Tensor):
+                mask = mask.cpu().numpy()
+            mask = mask.astype(bool)
 
         # 三分类
         prob3, y3 = aggregate_three_classes(prob, y_true, hap_map)
@@ -233,20 +240,43 @@ def metrics_by_maf(prob: torch.Tensor,
             'MaCH': mach_bins, 'IQS': iqs_bins}
 
 # ---------- 6. 打印 ----------
-def print_maf_stat_df(chunk_bin_cnt: List[int],
-                      train_bins_metrics: Dict[str, List[float]],
-                      val_bins_metrics: Dict[str, List[float]]):
-    maf_df = pd.DataFrame({
-        'MAF_bin': ['(0.00, 0.05)', '(0.05, 0.10)', '(0.10, 0.20)',
-                    '(0.20, 0.30)', '(0.30, 0.40)', '(0.40, 0.50)'],
-        'Counts':  [f"{c}" for c in chunk_bin_cnt],
-        'Train_Acc':   [f"{v:.3f}" for v in train_bins_metrics['Acc']],
-        'Val_Acc':     [f"{v:.3f}" for v in val_bins_metrics['Acc']],
-        'Train_INFO':  [f"{v:.3f}" for v in train_bins_metrics['INFO']],
-        'Val_INFO':    [f"{v:.3f}" for v in val_bins_metrics['INFO']],
-        'Train_MaCH':  [f"{v:.3f}" for v in train_bins_metrics['MaCH']],
-        'Val_MaCH':    [f"{v:.3f}" for v in val_bins_metrics['MaCH']],
-        'Train_IQS':   [f"{v:.3f}" for v in train_bins_metrics['IQS']],
-        'Val_IQS':     [f"{v:.3f}" for v in val_bins_metrics['IQS']],
-    })
-    print(maf_df.to_string(index=False))
+def print_maf_stat_df(
+    chunk_bin_cnt: List[int],
+    bins_metrics: Dict[str, Dict[str, List[float]]],  # 外层 key 就是列前缀
+    maf_bins: List[str] = None,
+) -> None:
+    """
+    打印 MAF 分箱统计表。
+
+    Args:
+        chunk_bin_cnt: 每个 bin 的 SNP 数量，长度须与 maf_bins 一致。
+        bins_metrics: 任意组 metrics，例如
+                      {"train": train_bins_metrics,
+                       "val"  : val_bins_metrics,
+                       "test" : test_bins_metrics}
+        maf_bins:    手动指定 MAF 区间，默认使用原文的 6 个区间。
+    """
+    if maf_bins is None:
+        maf_bins = ['(0.00, 0.05)', '(0.05, 0.10)', '(0.10, 0.20)',
+                    '(0.20, 0.30)', '(0.30, 0.40)', '(0.40, 0.50)']
+
+    if len(chunk_bin_cnt) != len(maf_bins):
+        raise ValueError("len(chunk_bin_cnt) != len(maf_bins)")
+
+    # 1. 构造基础 DataFrame
+    df = pd.DataFrame({'MAF_bin': maf_bins,
+                       'Counts':  [f"{c}" for c in chunk_bin_cnt]})
+
+    # 2. 动态拼接所有指标列
+    #    指标名从第一组 metrics 里提取，保持顺序一致
+    first_group = next(iter(bins_metrics.values()))
+    metrics_names = sorted(first_group.keys())   # 例如 ['Acc', 'INFO', 'IQS', 'MaCH']
+
+    for prefix in sorted(bins_metrics.keys()):   # 按字母序，保证列顺序稳定
+        grp = bins_metrics[prefix]
+        for m in metrics_names:
+            col_name = f"{prefix}_{m}"
+            df[col_name] = [f"{v:.3f}" for v in grp[m]]
+
+    # 3. 打印（不带行索引）
+    print(df.to_string(index=False))
