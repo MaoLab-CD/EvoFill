@@ -327,6 +327,43 @@ class GenomicDataset(Dataset):
 
         return x_onehot, y_onehot, real_idx
 
+class GenomicDataset_Missing(Dataset):
+    """Dataset class for genomic data with masking for training"""
+    def __init__(self, x_gts_sparse, evo_mat=None, seq_depth=4,
+                 mask=True, masking_rates=(0.5, 0.99), indices=None):
+        """
+        x_gts_sparse: scipy.sparse.csr_matrix or similar
+        evo_mat: numpy array or None
+        indices: 可选，指定要使用的样本索引（如 train/valid 索引）
+        """
+        self.gts_sparse = x_gts_sparse
+        self.evo_mat = evo_mat
+        self.seq_depth = seq_depth
+        self.mask = mask
+        self.masking_rates = masking_rates
+        self.indices = indices if indices is not None else np.arange(x_gts_sparse.shape[0])
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        x = self.gts_sparse[real_idx].toarray().squeeze().astype(np.int8)
+        y = x.copy()
+
+        if self.mask:
+            seq_len = len(x)
+            masking_rate = np.random.uniform(*self.masking_rates)
+            mask_size = int(seq_len * masking_rate)
+            mask_indices = np.random.choice(seq_len, mask_size, replace=False)
+            x[mask_indices] = self.seq_depth - 1  # missing token
+
+        x_onehot = torch.FloatTensor(np.eye(self.seq_depth)[x])
+        # y_onehot = torch.FloatTensor(np.eye(self.seq_depth - 1)[y])
+        y_onehot = torch.FloatTensor(np.eye(self.seq_depth)[y])
+
+        return x_onehot, y_onehot, real_idx
+
 class ImputationDataset(Dataset):
     """
     推理专用 Dataset

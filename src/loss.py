@@ -34,7 +34,7 @@ class ImputationLoss(nn.Module):
 
     def forward(self, logits, prob, y_true, y_evo_mat = None):
         batch_size = y_true.size(0)
-        lbl = y_true.argmax(dim=-1)   # 取最大索引
+        lbl = y_true.argmax(dim=-1)
         ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
                                 lbl.view(-1),
                                 reduction='sum')
@@ -95,6 +95,129 @@ class ImputationLoss(nn.Module):
                 'r2':r2_loss.item(),
                 'evo':evo_loss.item()}
 
+        return total_loss, logs
+
+class ImputationLoss_Missing(nn.Module):
+    """
+    基因组缺失填充自定义损失
+    维度约定：
+        BATCH_SIZE  : B
+        N_LOCUS     : L   （位点数）
+        N_CLASS     : C   （变异类型数，不含缺失）
+        N_CLASS_FULL: C+1 （含缺失）
+    """
+
+    def __init__(self,
+                 use_r2: bool = True,
+                 use_evo: bool = False,
+                 r2_weight: float = 1.0,
+                 evo_weight: float = 1.0,
+                 evo_lambda: float = 1.0):
+        super().__init__()
+        self.use_r2_loss = use_r2
+        self.use_evo_loss = use_evo
+        self.r2_weight = r2_weight
+        self.evo_weight = evo_weight
+        self.evo_lambda = evo_lambda
+        self.eps = 1e-8
+
+    # ------------- 私有工具 -------------
+    def _calculate_minimac_r2(self,
+                              pred_alt_allele_probs: torch.Tensor,
+                              true_alt_af: torch.Tensor,
+                              miss_mask: torch.Tensor):
+        """
+        pred_alt_allele_probs: (N_LOCUS,)
+        true_alt_af          : (N_LOCUS,)
+        miss_mask            : (N_LOCUS,)  True=缺失
+        """
+        # 缺失位点不参与计算
+        true_alt_af = torch.where(miss_mask, 0.5, true_alt_af)
+        mask = torch.logical_or(true_alt_af.eq(0.0), true_alt_af.eq(1.0))
+        denom = true_alt_af * (1. - true_alt_af)
+        denom = denom.clamp_min(0.01)
+        r2 = (pred_alt_allele_probs - true_alt_af).square() / denom
+        r2 = torch.where(torch.logical_or(mask, miss_mask), 0., r2)
+        return r2
+
+    def _js_div(self, p: torch.Tensor, q: torch.Tensor):
+        """
+        Jensen-Shannon 散度
+        p, q: (N_LOCUS, N_CLASS)
+        return: (N_LOCUS,)
+        """
+        eps = 1e-7
+        m = 0.5 * (p + q)
+        kl_pm = (p * (p + eps).log() - p * (m + eps).log()).sum(-1)
+        kl_qm = (q * (q + eps).log() - q * (m + eps).log()).sum(-1)
+        return 0.5 * (kl_pm + kl_qm)
+
+    # ------------- 前向 -------------
+    def forward(self,
+                logits: torch.Tensor,      # (BATCH_SIZE, N_LOCUS, N_CLASS)
+                prob: torch.Tensor,        # (BATCH_SIZE, N_LOCUS, N_CLASS)
+                y_true: torch.Tensor,      # (BATCH_SIZE, N_LOCUS, N_CLASS_FULL)
+                y_evo_mat: torch.Tensor = None):  # (BATCH_SIZE, BATCH_SIZE)
+        BATCH_SIZE, N_LOCUS, N_CLASS = prob.shape
+        N_CLASS_FULL = y_true.shape[-1]          # = N_CLASS + 1
+        DEVICE = prob.device
+
+        # 1. 交叉熵：忽略缺失类
+        lbl = y_true.argmax(-1)                  # (BATCH_SIZE, N_LOCUS)
+        ce_loss = F.cross_entropy(logits.view(-1, N_CLASS),
+                                  lbl.view(-1),
+                                  ignore_index=N_CLASS,
+                                  reduction='sum')
+
+        total_loss = ce_loss
+        r2_loss = torch.zeros((), device=DEVICE)
+        evo_loss = torch.zeros((), device=DEVICE)
+
+        # 2. R² 损失
+        if self.use_r2_loss:
+            GROUP_SIZE = 4
+            N_FULL_GROUPS = BATCH_SIZE // GROUP_SIZE
+            if N_FULL_GROUPS > 0:
+                y_true_grp = y_true[:N_FULL_GROUPS * GROUP_SIZE].view(
+                    N_FULL_GROUPS, GROUP_SIZE, N_LOCUS, N_CLASS_FULL)
+                prob_grp = prob[:N_FULL_GROUPS * GROUP_SIZE].view(
+                    N_FULL_GROUPS, GROUP_SIZE, N_LOCUS, N_CLASS)
+
+                r2_sum = 0.
+                for g in range(N_FULL_GROUPS):
+                    # 非缺失掩码 (N_LOCUS,)
+                    nonmiss = (y_true_grp[g].argmax(-1) != N_CLASS).any(0)
+                    # 计算 AF（仅非缺失）
+                    alt_cnt = y_true_grp[g, :, :, 1:N_CLASS].sum((0, 2))
+                    af = alt_cnt / (GROUP_SIZE * nonmiss.sum().float()).clamp_min(1)
+                    # 预测 ALT 剂量
+                    pred_alt = prob_grp[g, :, :, 1:N_CLASS].sum(-1).mean(0)
+                    r2_sum += self._calculate_minimac_r2(pred_alt, af, ~nonmiss).sum() * GROUP_SIZE
+                r2_loss = self.r2_weight * r2_sum / BATCH_SIZE
+                total_loss += r2_loss
+
+        # 3. 演化损失
+        if self.use_evo_loss and y_evo_mat is not None:
+            nonmiss = (y_true.argmax(-1) != N_CLASS)          # (BATCH_SIZE, N_LOCUS)
+            same_gt = (lbl.unsqueeze(1) == lbl.unsqueeze(0))  # (BATCH_SIZE, BATCH_SIZE, N_LOCUS)
+            mask = nonmiss.unsqueeze(1) & nonmiss.unsqueeze(0) & same_gt
+
+            js = torch.zeros(BATCH_SIZE, BATCH_SIZE, device=DEVICE)
+            for i in range(BATCH_SIZE):
+                for j in range(BATCH_SIZE):
+                    msk = mask[i, j]
+                    if msk.sum() == 0:
+                        continue
+                    js[i, j] = (self._js_div(prob[i], prob[j]) * msk).sum() / msk.sum().clamp_min(1)
+
+            w = torch.exp(-self.evo_lambda * y_evo_mat)
+            w = w / (w.sum(1, keepdim=True) + self.eps)
+            evo_loss = self.evo_weight * (w * js).sum()
+            total_loss += evo_loss
+
+        logs = {'ce': ce_loss.item(),
+                'r2': r2_loss.item(),
+                'evo': evo_loss.item()}
         return total_loss, logs
 
 class GradNormImputationLoss(nn.Module):
@@ -160,18 +283,59 @@ class GradNormImputationLoss(nn.Module):
 
 
 if __name__ == "__main__":
-    B, L = 12, 1000
-    logits = torch.randn(B, L, 3)
-    prob = F.softmax(logits, dim=-1)
+    # B, L = 12, 1000
+    # logits = torch.randn(B, L, 3)
+    # prob = F.softmax(logits, dim=-1)
 
-    targets = torch.randint(0, 3, (B, L))
-    y_true_oh = F.one_hot(targets.long(), num_classes=3).float()
+    # targets = torch.randint(0, 3, (B, L))
+    # y_true_oh = F.one_hot(targets.long(), num_classes=3).float()
 
-    y_evo_mat = torch.rand(B, B)
-    y_evo_mat = (y_evo_mat + y_evo_mat.T) / 2
-    y_evo_mat.fill_diagonal_(0.)
+    # y_evo_mat = torch.rand(B, B)
+    # y_evo_mat = (y_evo_mat + y_evo_mat.T) / 2
+    # y_evo_mat.fill_diagonal_(0.)
 
-    loss_fn = ImputationLoss(use_r2=True,use_evo=True)
-    loss, logs= loss_fn(logits, prob, y_true_oh, y_evo_mat)
-    print(loss.item())
-    print(logs)
+    # loss_fn = ImputationLoss(use_r2=True,use_evo=True)
+    # loss, logs= loss_fn(logits, prob, y_true_oh, y_evo_mat)
+    # print(loss.item())
+    # print(logs)
+    BATCH_SIZE = 16
+    N_LOCUS = 32
+    N_CLASS = 4          # 0=REF，1~3=ALT，不含缺失
+    DEVICE = 'cpu'       # 无 GPU 也能跑
+
+    # ---------- 1. 构造不带缺失的数据 ----------
+    print('=== 测试 1：y_true 不含缺失 ===')
+    y_true_clean = torch.zeros(BATCH_SIZE, N_LOCUS, N_CLASS, device=DEVICE)
+    # 随机 one-hot
+    for b in range(BATCH_SIZE):
+        for l in range(N_LOCUS):
+            cls = torch.randint(0, N_CLASS, (1,)).item()
+            y_true_clean[b, l, cls] = 1.
+
+    logits = torch.randn(BATCH_SIZE, N_LOCUS, N_CLASS, device=DEVICE)
+    prob   = logits.softmax(-1)
+    y_evo  = torch.rand(BATCH_SIZE, BATCH_SIZE, device=DEVICE)
+
+    # loss_fn = ImputationLoss(use_r2=True, use_evo=True)
+    loss_fn = ImputationLoss_Missing(use_r2=True, use_evo=True)
+    
+    loss, logs = loss_fn(logits, prob, y_true_clean, y_evo)
+    print('total_loss =', loss.item())
+    print('logs =', logs)
+
+    # ---------- 2. 构造带缺失的数据 ----------
+    print('\n=== 测试 2：y_true 含缺失 ===')
+    N_CLASS_FULL = N_CLASS + 1
+    y_true_missing = torch.zeros(BATCH_SIZE, N_LOCUS, N_CLASS_FULL, device=DEVICE)
+    for b in range(BATCH_SIZE):
+        for l in range(N_LOCUS):
+            cls = torch.randint(0, N_CLASS_FULL, (1,)).item()
+            y_true_missing[b, l, cls] = 1.
+
+    # 同样重新生成 logits/prob（形状仍是 N_CLASS）
+    logits = torch.randn(BATCH_SIZE, N_LOCUS, N_CLASS, device=DEVICE)
+    prob   = logits.softmax(-1)
+
+    loss, logs = loss_fn(logits, prob, y_true_missing, y_evo)
+    print('total_loss =', loss.item())
+    print('logs =', logs)
