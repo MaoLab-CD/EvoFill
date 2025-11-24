@@ -40,9 +40,9 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def create_directories(save_dir, ) -> None:
+def setup_workdir(save_dir, ) -> None:
     """Create necessary directories"""
-    sub_dir = ["models", "pre_train", "urp_finetune", "impute_in", "impute_out"]
+    sub_dir = ["models", "pretrain", "augment", "finetune", "impute_in", "impute_out"]
     if not os.path.exists(save_dir):
             os.makedirs(save_dir)
     for dd in sub_dir:

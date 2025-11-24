@@ -1,0 +1,272 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Stage-3 训练脚本
+DeepSpeed ZeRO-3 多卡并行
+只训练 embedding + global_out，不分 chunk
+运行：
+    accelerate launch --config_file ds_zero3.yaml train_stage3_deepspeed.py
+"""
+import math
+import torch
+import numpy as np
+from pathlib import Path
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from torch.optim import SparseAdam, AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from accelerate import Accelerator
+from accelerate.utils import set_seed as accelerate_set_seed
+
+from src.data import GenotypeEncoder, GenomicDataset_Missing
+from src.model import EvoFill
+from src.loss import ImputationLoss_Missing
+
+# ================= 1. 超参数（可拎出去 config_stage3.py） =================
+MODEL_NAME         = "chr22_trim"
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251121_chr22_v2/')
+PRETRAIN_DIR       = WORK_DIR / "pretrain"   # 测试集来源
+AUGMENT_DIR        = WORK_DIR / "augment"      ### Stage-3 差异：增强数据
+MODEL_SAVE_DIR     = WORK_DIR / "models"
+
+TEST_RATIO         = 0.30                    ### Stage-3 差异：30% 预训练样本做测试
+BATCH_SIZE         = 32
+MIN_MASK_RATE      = 0.3
+MAX_MASK_RATE      = 0.7
+
+
+CHUNK_SIZE         = 32768
+OVERLAP            = 1024
+D_MODEL            = 64
+D_STATE            = 64
+HEADDIM            = 128
+
+MAX_EPOCHS         = 1000
+EARLYSTOP_PATIENCE = 11
+SCHEDULER_FACTOR   = 0.5
+SCHEDULER_PATIENCE = 5
+SCHEDULER_MIN_LR   = 1e-9
+SEED               = 3047
+
+# 优化器
+SPARSE_LR          = 1e-4
+SPARSE_BETAS       = (0.9, 0.999)
+DENSE_LR           = 1e-4
+DENSE_BETAS        = (0.9, 0.999)
+DENSE_WD           = 1e-6
+# ============================================================================
+
+def pprint(*args):
+    if accelerator.is_main_process:
+        print(*args)
+
+# -------------- 0. Accelerator --------------
+accelerator = Accelerator()          # 全自动读取 yaml
+device = accelerator.device
+accelerate_set_seed(SEED)
+world_size = accelerator.num_processes
+
+SCHEDULER_PATIENCE = SCHEDULER_PATIENCE * world_size
+EARLYSTOP_PATIENCE = EARLYSTOP_PATIENCE * world_size 
+# -------------- 1. 数据 --------------
+
+# ### Stage-3 差异：训练集=augment，测试集=pretrain 随机 30%
+gt_enc_train = GenotypeEncoder.loadfromdisk(AUGMENT_DIR)
+gt_enc_test  = GenotypeEncoder.loadfromdisk(PRETRAIN_DIR)
+assert gt_enc_train.seq_depth  == gt_enc_test.seq_depth
+assert gt_enc_train.n_variants == gt_enc_test.n_variants
+
+TOTAL_SITES = gt_enc_train.n_variants
+ALLELES     = gt_enc_train.seq_depth
+pprint(f"Train: {gt_enc_train.n_samples:,} samples")
+pprint(f"Test : {gt_enc_test.n_samples:,} samples")
+
+# 测试集随机 30%
+test_idx, _ = train_test_split(
+    range(gt_enc_test.n_samples),
+    test_size=1-TEST_RATIO,
+    random_state=SEED,
+    shuffle=True
+)
+pprint(f"Actually use {len(test_idx):,} samples for test")
+
+train_ds = GenomicDataset_Missing(
+    gt_enc_train, evo_mat=gt_enc_train.evo_mat, mask=True,
+    masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE), indices=None
+)
+test_ds = GenomicDataset_Missing(
+    gt_enc_test, evo_mat=gt_enc_test.evo_mat, mask=True,
+    masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE), indices=test_idx
+)
+
+def collate_fn(batch):
+    x = torch.stack([b[0] for b in batch])
+    y = torch.stack([b[1] for b in batch])
+    idx = [b[2] for b in batch]
+    evo = train_ds.evo_mat[np.ix_(idx, idx)] if train_ds.evo_mat is not None else np.empty(0)
+    evo = torch.FloatTensor(evo) if evo.size else torch.empty(0)
+    return x, y, evo
+
+train_loader = torch.utils.data.DataLoader(
+    train_ds, batch_size=BATCH_SIZE, shuffle=True,
+    num_workers=4, pin_memory=True, collate_fn=collate_fn
+)
+test_loader = torch.utils.data.DataLoader(
+    test_ds, batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=4, pin_memory=True, collate_fn=collate_fn
+)
+
+# -------------- 2. 模型 --------------
+
+model_raw = EvoFill(ALLELES, TOTAL_SITES, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM)
+ckpt = torch.load(f'{MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth', map_location='cpu')
+model_raw.load_state_dict(ckpt['model_state'])
+
+
+# -------------- 3. 只解冻 embedding + global_out --------------
+trainable_dense, trainable_sparse = [], []
+# 3.1 GlobalOut 全部
+for name, p in model_raw.global_out.named_parameters():
+    if 'idx_embed' in name:
+        trainable_sparse.append(p)
+    else:
+        trainable_dense.append(p)
+# 3.2 Chunk-Embedding
+for emb in model_raw.chunk_embeds:
+    for p in emb.parameters():
+        trainable_dense.append(p)
+
+# 先全部冻住
+for p in model_raw.parameters():
+    p.requires_grad = False
+# 再放开需要的
+for p in trainable_dense + trainable_sparse:
+    p.requires_grad = True
+
+pprint(f"Trainable dense params: {len(trainable_dense)}")
+pprint(f"Trainable sparse params: {len(trainable_sparse)}")
+
+# -------------- 4. 双优化器 --------------
+optim_sparse = SparseAdam(trainable_sparse, lr=SPARSE_LR, betas=SPARSE_BETAS) \
+               if trainable_sparse else None
+optim_dense  = AdamW(trainable_dense, lr=DENSE_LR, betas=DENSE_BETAS, weight_decay=DENSE_WD)
+
+sched_sparse = ReduceLROnPlateau(optim_sparse, mode='min', factor=SCHEDULER_FACTOR,
+                                 patience=SCHEDULER_PATIENCE, min_lr=SCHEDULER_MIN_LR) \
+               if optim_sparse else None
+sched_dense  = ReduceLROnPlateau(optim_dense, mode='min', factor=SCHEDULER_FACTOR,
+                                 patience=SCHEDULER_PATIENCE, min_lr=SCHEDULER_MIN_LR)
+
+# -------------- 5. Accelerator 封装 --------------
+model, *opt_sch = accelerator.prepare(
+    model_raw, optim_sparse, optim_dense, sched_sparse, sched_dense,
+    train_loader, test_loader
+)
+optim_sparse, optim_dense, sched_sparse, sched_dense = opt_sch[:4]
+
+# -------------- 6. Loss --------------
+
+# criterion = ImputationLoss_Missing(use_r2=True, use_evo=False)
+criterion = ImputationLoss_Missing(use_r2=True, use_evo=True, r2_weight=1, evo_weight=4, evo_lambda=10)
+
+# -------------- 7. 训练 --------------
+best_loss = math.inf
+patience_counter = 0
+predres_with_bestloss = None
+
+for epoch in range(MAX_EPOCHS):
+    # ---- train ----
+    model.train()
+    tot_loss = 0.0
+    train_prob, train_gts, train_mask = [], [], []
+    train_pbar = tqdm(train_loader, disable=not accelerator.is_main_process,
+                          desc=f"Epoch {epoch+1} / {MAX_EPOCHS} [aDNA]")
+    for _, (x, y, evo) in enumerate(train_pbar):
+        x, y = x.to(device), y.to(device)
+        evo = evo.to(device) if evo.numel() else None
+
+        if optim_sparse:
+            optim_sparse.zero_grad()
+        optim_dense.zero_grad()
+
+        # 不分 chunk → cid=None
+        logits, prob, mask_idx = model(x, None)
+        loss, logs = criterion(logits[:, mask_idx], prob[:, mask_idx],
+                               y[:, mask_idx], evo)
+        accelerator.backward(loss)
+        if optim_sparse:
+            optim_sparse.step()
+        optim_dense.step()
+        tot_loss += loss.item()
+
+        train_pbar.set_postfix({'loss': loss.item(), 'ce':logs['ce'], 'r2':logs['r2'], 'evo':logs['evo']})
+
+        # 收集指标
+        miss_mask = x[:, mask_idx][..., -1].bool()
+        train_prob.append(prob[:, mask_idx].detach())
+        train_gts.append(y[:, mask_idx].detach())
+        train_mask.append(miss_mask)
+
+    avg_train_loss = tot_loss / len(train_loader)
+    train_prob = torch.cat(train_prob, dim=0)
+    train_gts  = torch.cat(train_gts,  dim=0)
+    train_mask = torch.cat(train_mask, dim=0)
+
+    # ---- eval ----
+    model.eval()
+    tot_loss = 0.0
+    test_prob, test_gts = [], []
+    with torch.no_grad():
+        for x, y, evo in tqdm(test_loader, disable=not accelerator.is_main_process,
+                          desc=f"Epoch {epoch+1} / {MAX_EPOCHS} [TEST]"):
+            x, y = x.to(device), y.to(device)
+            evo = evo.to(device) if evo.numel() else None
+            logits, prob, mask_idx = model(x, None)
+            loss, _ = criterion(logits[:, mask_idx], prob[:, mask_idx],
+                                y[:, mask_idx], evo)
+            tot_loss += loss.item()
+            test_prob.append(prob[:, mask_idx].detach())
+            test_gts.append(y[:, mask_idx].detach())
+
+    avg_test_loss = tot_loss / len(test_loader)
+    test_prob = torch.cat(test_prob, dim=0)
+    test_gts  = torch.cat(test_gts,  dim=0)
+
+    # scheduler
+    if sched_sparse:
+        sched_sparse.step(avg_test_loss)
+    sched_dense.step(avg_test_loss)
+
+    pprint(f"Epoch {epoch+1} / {MAX_EPOCHS}  aDNA={avg_train_loss:.3f}  test={avg_test_loss:.3f}  "
+           f"lr_dense={optim_dense.param_groups[0]['lr']:.2e}  "
+           f"lr_sparse={optim_sparse.param_groups[0]['lr']:.2e}" if optim_sparse else "")
+
+    # ---- early stop ----
+    if avg_test_loss < best_loss:
+        best_loss = avg_test_loss
+        patience_counter = 0
+        predres_with_bestloss = (train_prob, train_gts, test_prob, test_gts)
+        accelerator.wait_for_everyone()
+        unwrapped = accelerator.unwrap_model(model)
+        ckpt = {
+            "model_state": unwrapped.state_dict(),
+            "best_test_loss": best_loss,
+        }
+        if accelerator.is_main_process:
+            accelerator.save(ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_stage3.pth")
+            pprint(f"  --> updated {MODEL_NAME}_stage3.pth")
+    else:
+        patience_counter += 1
+        if patience_counter >= EARLYSTOP_PATIENCE:
+            pprint("Early stop!")
+            break
+
+# -------------- 8. 最终保存 --------------
+accelerator.wait_for_everyone()
+unwrapped = accelerator.unwrap_model(model)
+final_ckpt = {
+    "model_state": unwrapped.state_dict(),
+}
+if accelerator.is_main_process:
+    accelerator.save(final_ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_stage3.pth")
+    pprint(f"==> STAGE3 finished: {MODEL_SAVE_DIR}/{MODEL_NAME}_stage3.pth")

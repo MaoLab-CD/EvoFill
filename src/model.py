@@ -219,7 +219,7 @@ class StackMambaBlock(nn.Module):
 class ChunkModule(nn.Module):
     """Single chunk processing module with BiMamba"""
 
-    def __init__(self, d_model, dropout_rate=0.2):
+    def __init__(self, d_model, d_state=64, headdim=128, dropout_rate=0.2):
         super().__init__()
         self.d_model = d_model
 
@@ -236,6 +236,12 @@ class ChunkModule(nn.Module):
         # self.cross_attention = CrossAttentionLayer(d_model, n_heads)
         self.stack_mamba = StackMambaBlock(
             d_model=d_model,
+            d_state=d_state,
+            d_conv=4,
+            expand=2,
+            headdim=headdim,
+            ngroups=1,
+            dropout=0.0,
         )
 
         # Additional layers
@@ -401,11 +407,13 @@ class GlobalOut(nn.Module):
 class EvoFill(nn.Module):
     def __init__(
         self,
-        d_model: int,
         n_alleles: int,
         total_sites: int,
         chunk_size: int = 8192,
         chunk_overlap: int = 64,
+        d_model: int = 64,
+        d_state: int = 64, 
+        headdim: int = 128,
         dropout_rate: float = 0.1,
     ):
         super().__init__()
@@ -428,7 +436,7 @@ class EvoFill(nn.Module):
             GenoEmbedding(n_alleles, e - s, d_model) for s, e in zip(starts, ends)
         )
         self.chunk_modules = nn.ModuleList(
-            ChunkModule(d_model, dropout_rate) for s, e in zip(starts, ends)
+            ChunkModule(d_model,d_state, headdim, dropout_rate) for s, e in zip(starts, ends)
         )
 
         # 3. 全局输出层
@@ -475,7 +483,8 @@ class EvoFill(nn.Module):
         logits  = self.global_out(z_full, mask)                     # (B, L, n_alleles-1)
 
         # 4. 返回并集区域
-        prob = F.softmax(logits, dim=-1)
+        prob = torch.full_like(logits, 0.)                  # 先占位
+        prob[:, mask] = F.softmax(logits[:, mask], dim=-1)
 
         return logits, prob, torch.where(mask)[0]
 
@@ -484,6 +493,8 @@ if __name__ == '__main__':
     # ---------- 假数据 ----------
     B, L, A = 8, 1000000, 3
     d_model = 64
+    d_state = 64
+    headdim = 64
     chunk_size, overlap = 65536, 1024
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -498,7 +509,7 @@ if __name__ == '__main__':
     print(f"y_train: {y_train.shape}")
     print("")
     # ---------- 模型 &损失 ----------
-    model = EvoFill(d_model, A, L, chunk_size, overlap).to(device)
+    model = EvoFill(A, L, chunk_size, overlap, d_model, d_state, headdim).to(device)
     print(f"model chunks: {model.n_chunks}")
 
     print("单 chunk 测试")

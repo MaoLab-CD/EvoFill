@@ -38,32 +38,27 @@ class ImputationLoss(nn.Module):
         ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
                                 lbl.view(-1),
                                 reduction='sum')
-        total_loss = ce_loss
 
         r2_loss = torch.zeros((), device=prob.device)
         if self.use_r2_loss:
-
             group_size = 4
             num_full_groups = batch_size // group_size
-
+            r2_sum  =0.
             if num_full_groups > 0:
                 y_true_grouped = y_true[:num_full_groups * group_size].view(
                     num_full_groups, group_size, *y_true.shape[1:])
                 y_pred_grouped = prob[:num_full_groups * group_size].view(
                     num_full_groups, group_size, *prob.shape[1:])
-
-                r2_loss = 0.0
                 for i in range(num_full_groups):
                     gt_alt_af = torch.count_nonzero(
                         torch.argmax(y_true_grouped[i], dim=-1), dim=0
                     ).float() / group_size
 
                     pred_alt_allele_probs = torch.sum(y_pred_grouped[i][:, :, 1:], dim=-1)
-                    r2_loss += -torch.sum(self.calculate_minimac_r2(
+                    r2_sum += -torch.sum(self.calculate_minimac_r2(
                         pred_alt_allele_probs, gt_alt_af)) * group_size
 
-                r2_loss = self.r2_weight * r2_loss / batch_size
-                total_loss += r2_loss
+                r2_loss = self.r2_weight * r2_sum / batch_size
 
         evo_loss = torch.zeros((), device=prob.device)
         if self.use_evo_loss and y_evo_mat is not None:
@@ -88,13 +83,13 @@ class ImputationLoss(nn.Module):
             w = w / (w.sum(dim=1, keepdim=True) + self.eps)
 
             evo_loss =  self.evo_weight * (w * js).sum()
-
-            total_loss += evo_loss
+            if not torch.isfinite(evo_loss):
+                evo_loss = torch.tensor(0., device=evo_loss.device)
 
         logs = {'ce':ce_loss.item(),
                 'r2':r2_loss.item(),
                 'evo':evo_loss.item()}
-
+        total_loss = ce_loss + r2_loss + evo_loss
         return total_loss, logs
 
 class ImputationLoss_Missing(nn.Module):
@@ -139,7 +134,7 @@ class ImputationLoss_Missing(nn.Module):
         r2 = (pred_alt_allele_probs - true_alt_af).square() / denom
         r2 = torch.where(torch.logical_or(mask, miss_mask), 0., r2)
         return r2
-
+    
     def _js_div(self, p: torch.Tensor, q: torch.Tensor):
         """
         Jensen-Shannon 散度
@@ -147,9 +142,11 @@ class ImputationLoss_Missing(nn.Module):
         return: (N_LOCUS,)
         """
         eps = 1e-7
+        p = p.clamp_min(eps)          # 防止真 0
+        q = q.clamp_min(eps)
         m = 0.5 * (p + q)
-        kl_pm = (p * (p + eps).log() - p * (m + eps).log()).sum(-1)
-        kl_qm = (q * (q + eps).log() - q * (m + eps).log()).sum(-1)
+        kl_pm = (p * p.log() - p * m.log()).sum(-1)
+        kl_qm = (q * q.log() - q * m.log()).sum(-1)
         return 0.5 * (kl_pm + kl_qm)
 
     # ------------- 前向 -------------
@@ -168,12 +165,9 @@ class ImputationLoss_Missing(nn.Module):
                                   lbl.view(-1),
                                   ignore_index=N_CLASS,
                                   reduction='sum')
-
-        total_loss = ce_loss
-        r2_loss = torch.zeros((), device=DEVICE)
-        evo_loss = torch.zeros((), device=DEVICE)
-
+        
         # 2. R² 损失
+        r2_loss = torch.zeros((), device=DEVICE)
         if self.use_r2_loss:
             GROUP_SIZE = 4
             N_FULL_GROUPS = BATCH_SIZE // GROUP_SIZE
@@ -192,11 +186,11 @@ class ImputationLoss_Missing(nn.Module):
                     af = alt_cnt / (GROUP_SIZE * nonmiss.sum().float()).clamp_min(1)
                     # 预测 ALT 剂量
                     pred_alt = prob_grp[g, :, :, 1:N_CLASS].sum(-1).mean(0)
-                    r2_sum += self._calculate_minimac_r2(pred_alt, af, ~nonmiss).sum() * GROUP_SIZE
+                    r2_sum += -self._calculate_minimac_r2(pred_alt, af, ~nonmiss).sum() * GROUP_SIZE
                 r2_loss = self.r2_weight * r2_sum / BATCH_SIZE
-                total_loss += r2_loss
 
         # 3. 演化损失
+        evo_loss = torch.zeros((), device=DEVICE)
         if self.use_evo_loss and y_evo_mat is not None:
             nonmiss = (y_true.argmax(-1) != N_CLASS)          # (BATCH_SIZE, N_LOCUS)
             same_gt = (lbl.unsqueeze(1) == lbl.unsqueeze(0))  # (BATCH_SIZE, BATCH_SIZE, N_LOCUS)
@@ -213,11 +207,13 @@ class ImputationLoss_Missing(nn.Module):
             w = torch.exp(-self.evo_lambda * y_evo_mat)
             w = w / (w.sum(1, keepdim=True) + self.eps)
             evo_loss = self.evo_weight * (w * js).sum()
-            total_loss += evo_loss
+            if not torch.isfinite(evo_loss):
+                evo_loss = torch.tensor(0., device=evo_loss.device)
 
         logs = {'ce': ce_loss.item(),
                 'r2': r2_loss.item(),
                 'evo': evo_loss.item()}
+        total_loss = ce_loss + r2_loss + evo_loss
         return total_loss, logs
 
 class GradNormImputationLoss(nn.Module):
@@ -283,21 +279,6 @@ class GradNormImputationLoss(nn.Module):
 
 
 if __name__ == "__main__":
-    # B, L = 12, 1000
-    # logits = torch.randn(B, L, 3)
-    # prob = F.softmax(logits, dim=-1)
-
-    # targets = torch.randint(0, 3, (B, L))
-    # y_true_oh = F.one_hot(targets.long(), num_classes=3).float()
-
-    # y_evo_mat = torch.rand(B, B)
-    # y_evo_mat = (y_evo_mat + y_evo_mat.T) / 2
-    # y_evo_mat.fill_diagonal_(0.)
-
-    # loss_fn = ImputationLoss(use_r2=True,use_evo=True)
-    # loss, logs= loss_fn(logits, prob, y_true_oh, y_evo_mat)
-    # print(loss.item())
-    # print(logs)
     BATCH_SIZE = 16
     N_LOCUS = 32
     N_CLASS = 4          # 0=REF，1~3=ALT，不含缺失

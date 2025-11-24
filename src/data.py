@@ -22,6 +22,7 @@ class GenotypeEncoder:
         self.save_dir = save_dir
         # 其余占位
         self.hap_map: Dict[str, int] = {}
+        self.default_gt = None
         self.seq_depth: Optional[int] = None
         self.n_samples = 0
         self.n_variants = 0
@@ -31,7 +32,7 @@ class GenotypeEncoder:
         self.evo_mat: Optional[np.ndarray] = None
 
     # ========= 2. 首次编码：建立标准 =========
-    def encode_new(self, vcf_path: str, evo_mat: Optional[str] = None,):
+    def encode_new(self, vcf_path: str, default_gt: str, evo_mat: Optional[str] = None,):
         """第一次编码，允许新建 hap_map 与 seq_depth"""
         self.vcf_path = vcf_path
         # 清空头一次可能遗留的参照
@@ -40,7 +41,7 @@ class GenotypeEncoder:
         self.evo_mat_path = evo_mat
         self.phased = self.phased if self.evo_mat_path is None else False
         # 真正干活
-        self.X_gt = self._load_gt()
+        self.X_gt = self._load_gt(default_gt)
         self.evo_mat = self._load_evo_mat() if self.evo_mat_path else None
 
         if self.gts012:
@@ -61,7 +62,7 @@ class GenotypeEncoder:
         return self
 
     # ========= 3. 参照编码：必须 100 % 一致 =========
-    def encode_ref(self, ref_meta_json: str, vcf_path: str,  evo_mat: Optional[str] = None):
+    def encode_ref(self, ref_meta_json: str, vcf_path: str, default_gt: str, evo_mat: Optional[str] = None):
         """按已有 meta 编码新 VCF，任何不一致都抛异常"""
         if not os.path.isfile(ref_meta_json):
             raise FileNotFoundError(ref_meta_json)
@@ -80,7 +81,7 @@ class GenotypeEncoder:
 
         # 编码
         self.vcf_path = vcf_path
-        self.X_gt = self._load_gt()
+        self.X_gt = self._load_gt(default_gt)
 
         self.evo_mat_path = evo_mat
         self.evo_mat = self._load_evo_mat() if self.evo_mat_path else None
@@ -168,7 +169,11 @@ class GenotypeEncoder:
             return out
 
     # ========= 5. 内部方法 =========
-    def _load_gt(self):
+    def _load_gt(self, default_gt):
+        self.default_gt = default_gt
+        if self.default_gt not in {'ref', 'miss'}:
+            raise ValueError('default_gt must be "ref" or "miss"')
+
         interval = 10000
         cols, data, indptr = [], [], [0]
         vcf = VCF(self.vcf_path, gts012=self.gts012)
@@ -179,7 +184,12 @@ class GenotypeEncoder:
 
         for rec in vcf:
             vec = self._encode_gt(rec, self.n_samples, phase=self.phased, gts012=self.gts012)
-            nz_idx = np.flatnonzero(vec)
+            if self.default_gt == 'ref':          # 只存 alt（非 ref）
+                nz_mask = vec != 0
+            else:                                 # 只存非 miss
+                miss_code = self.seq_depth - 1
+                nz_mask = vec != miss_code
+            nz_idx = np.flatnonzero(nz_mask)
             cols.extend(nz_idx)
             data.extend(vec[nz_idx])
             indptr.append(indptr[-1] + len(nz_idx))
@@ -223,6 +233,7 @@ class GenotypeEncoder:
             "evo_mat": str(self.evo_mat_path),
             "phased": str(self.phased),
             "gts012": str(self.gts012),
+            "default_gt": str(self.default_gt),
             "n_samples": str(self.n_samples),
             "n_variants": str(self.n_variants),
             "seq_depth": str(self.seq_depth),
@@ -242,6 +253,42 @@ class GenotypeEncoder:
             for vid in self.variant_ids:
                 f.write(vid + "\n")
         print(f"[DATA] 结果已写入 {self.save_dir}")
+
+    def gts_toarray(self, idx=None):
+        """
+        把稀疏矩阵还原成 dense 数组。
+        参数
+        ----
+        idx : None | int | list/ndarray
+            None  -> 返回整个矩阵  (n_rows, n_variants)
+            int   -> 返回单行      (1, n_variants)
+            序列  -> 返回多行      (len(idx), n_variants)
+
+        返回值
+        ------
+        dense : ndarray, dtype=int8
+            缺失值 = seq_depth-1，参考型 = 0，alt = 原值
+        """
+        # 1. 统一成“行索引数组”
+        if idx is None:
+            row_idx = np.arange(self.X_gt.shape[0])
+        elif np.isscalar(idx):
+            row_idx = np.array([idx], dtype=int)
+        else:
+            row_idx = np.asarray(idx, dtype=int)
+
+        # 2. 拿子矩阵
+        sub = self.X_gt[row_idx]          # scipy 支持 fancy indexing
+        dense = sub.toarray()             # 形状 (len(row_idx), n_variants)
+
+        # 3. 根据编码策略填缺省值
+        if self.default_gt == 'ref':      # 当时只存了 alt → 其余填 0
+            miss_val = 0
+        else:                             # 当时只存了非 miss → 其余填 miss
+            miss_val = self.seq_depth - 1
+        dense[dense == 0] = miss_val      # 稀疏格式里“显式 0”就是没存的位置
+
+        return dense.astype(np.int8)
 
     @classmethod
     def loadfromdisk(cls, work_dir: str):
@@ -264,6 +311,7 @@ class GenotypeEncoder:
         obj = cls.__new__(cls)  # 不调用 __init__
         obj.vcf_path    = meta["vcf_path"]
         obj.evo_mat     = meta["evo_mat"]
+        obj.default_gt  = meta["default_gt"]
         obj.phased      = bool(meta["phased"])
         obj.gts012      = bool(meta["gts012"])
         obj.n_samples   = int(meta["n_samples"])
@@ -293,26 +341,26 @@ class GenotypeEncoder:
 
 class GenomicDataset(Dataset):
     """Dataset class for genomic data with masking for training"""
-    def __init__(self, x_gts_sparse, evo_mat=None, seq_depth=4,
+    def __init__(self, gt_encoder,evo_mat=None,
                  mask=True, masking_rates=(0.5, 0.99), indices=None):
         """
         x_gts_sparse: scipy.sparse.csr_matrix or similar
         evo_mat: numpy array or None
         indices: 可选，指定要使用的样本索引（如 train/valid 索引）
         """
-        self.gts_sparse = x_gts_sparse
+        self.gt_enc = gt_encoder
         self.evo_mat = evo_mat
-        self.seq_depth = seq_depth
+        self.seq_depth = gt_encoder.seq_depth
         self.mask = mask
         self.masking_rates = masking_rates
-        self.indices = indices if indices is not None else np.arange(x_gts_sparse.shape[0])
+        self.indices = indices if indices is not None else np.arange(self.gt_enc.X_gt.shape[0])
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
         real_idx = self.indices[idx]
-        x = self.gts_sparse[real_idx].toarray().squeeze().astype(np.int8)
+        x = self.gt_enc.gts_toarray(real_idx).squeeze()
         y = x.copy()
 
         if self.mask:
@@ -329,39 +377,45 @@ class GenomicDataset(Dataset):
 
 class GenomicDataset_Missing(Dataset):
     """Dataset class for genomic data with masking for training"""
-    def __init__(self, x_gts_sparse, evo_mat=None, seq_depth=4,
+    def __init__(self, gt_encoder,evo_mat=None,
                  mask=True, masking_rates=(0.5, 0.99), indices=None):
         """
         x_gts_sparse: scipy.sparse.csr_matrix or similar
         evo_mat: numpy array or None
         indices: 可选，指定要使用的样本索引（如 train/valid 索引）
         """
-        self.gts_sparse = x_gts_sparse
+        self.gt_enc = gt_encoder
         self.evo_mat = evo_mat
-        self.seq_depth = seq_depth
+        self.seq_depth = gt_encoder.seq_depth
         self.mask = mask
         self.masking_rates = masking_rates
-        self.indices = indices if indices is not None else np.arange(x_gts_sparse.shape[0])
+        self.indices = indices if indices is not None else np.arange(self.gt_enc.X_gt.shape[0])
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
         real_idx = self.indices[idx]
-        x = self.gts_sparse[real_idx].toarray().squeeze().astype(np.int8)
+        x = self.gt_enc.gts_toarray(real_idx).squeeze()
         y = x.copy()
 
         if self.mask:
-            seq_len = len(x)
-            masking_rate = np.random.uniform(*self.masking_rates)
-            mask_size = int(seq_len * masking_rate)
-            mask_indices = np.random.choice(seq_len, mask_size, replace=False)
-            x[mask_indices] = self.seq_depth - 1  # missing token
+            # 1. 找出“非缺失”下标
+            miss_code = self.seq_depth - 1
+            available = np.flatnonzero(y != miss_code) 
+            if available.size == 0:
+                pass
+            else:
+                # 2. 计算要遮多少
+                masking_rate = np.random.uniform(*self.masking_rates)
+                mask_size = int(len(available) * masking_rate)
+                mask_size = max(1, mask_size) if available.size > 0 else 0
+                # 3. 随机挑选并遮掉
+                mask_indices = np.random.choice(available, mask_size, replace=False)
+                x[mask_indices] = miss_code
 
         x_onehot = torch.FloatTensor(np.eye(self.seq_depth)[x])
-        # y_onehot = torch.FloatTensor(np.eye(self.seq_depth - 1)[y])
         y_onehot = torch.FloatTensor(np.eye(self.seq_depth)[y])
-
         return x_onehot, y_onehot, real_idx
 
 class ImputationDataset(Dataset):

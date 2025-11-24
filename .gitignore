@@ -2,3 +2,4 @@ data/*
 ckpt*
 src/__pycache__/*
 logs/*
+*.tar.gz
