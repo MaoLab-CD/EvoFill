@@ -12,8 +12,9 @@ import torch
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+from functools import partial
 from sklearn.model_selection import train_test_split
-from torch.optim import SparseAdam, AdamW
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from accelerate import Accelerator
 from accelerate.utils import set_seed as accelerate_set_seed
@@ -74,6 +75,7 @@ EARLYSTOP_PATIENCE = EARLYSTOP_PATIENCE * world_size
 # ### Stage-3 差异：训练集=augment，测试集=pretrain 随机 30%
 gt_enc_train = GenotypeEncoder.loadfromdisk(AUGMENT_DIR)
 gt_enc_test  = GenotypeEncoder.loadfromdisk(PRETRAIN_DIR)
+
 assert gt_enc_train.seq_depth  == gt_enc_test.seq_depth
 assert gt_enc_train.n_variants == gt_enc_test.n_variants
 
@@ -100,21 +102,25 @@ test_ds = GenomicDataset_Missing(
     masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE), indices=test_idx
 )
 
-def collate_fn(batch):
-    x = torch.stack([b[0] for b in batch])
-    y = torch.stack([b[1] for b in batch])
-    idx = [b[2] for b in batch]
-    evo = train_ds.evo_mat[np.ix_(idx, idx)] if train_ds.evo_mat is not None else np.empty(0)
-    evo = torch.FloatTensor(evo) if evo.size else torch.empty(0)
-    return x, y, evo
+def collate_fn(batch, dataset):
+    x_onehot = torch.stack([item[0] for item in batch])
+    y_onehot = torch.stack([item[1] for item in batch])
+    real_idx_list = [item[2] for item in batch]
+
+    if dataset.evo_mat is not None:
+        evo_mat_batch = dataset.evo_mat[np.ix_(real_idx_list, real_idx_list)]
+        evo_mat_batch = torch.FloatTensor(evo_mat_batch)
+    else:
+        evo_mat_batch = torch.empty(0)
+    return x_onehot, y_onehot, evo_mat_batch
 
 train_loader = torch.utils.data.DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
-    num_workers=4, pin_memory=True, collate_fn=collate_fn
+    num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=train_ds)
 )
 test_loader = torch.utils.data.DataLoader(
     test_ds, batch_size=BATCH_SIZE, shuffle=False,
-    num_workers=4, pin_memory=True, collate_fn=collate_fn
+    num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=test_ds)
 )
 
 # -------------- 2. 模型 --------------
@@ -246,10 +252,5 @@ for epoch in range(MAX_EPOCHS):
 
 # -------------- 8. 最终保存 --------------
 accelerator.wait_for_everyone()
-unwrapped = accelerator.unwrap_model(model)
-final_ckpt = {
-    "model_state": unwrapped.state_dict(),
-}
 if accelerator.is_main_process:
-    accelerator.save(final_ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_stage3.pth")
     pprint(f"==> STAGE3 finished: {MODEL_SAVE_DIR}/{MODEL_NAME}_stage3.pth")

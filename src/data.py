@@ -277,16 +277,29 @@ class GenotypeEncoder:
         else:
             row_idx = np.asarray(idx, dtype=int)
 
-        # 2. 拿子矩阵
-        sub = self.X_gt[row_idx]          # scipy 支持 fancy indexing
-        dense = sub.toarray()             # 形状 (len(row_idx), n_variants)
+        # 2. 拿子矩阵（仍是稀疏）
+        sub = self.X_gt[row_idx]
 
-        # 3. 根据编码策略填缺省值
-        if self.default_gt == 'ref':      # 当时只存了 alt → 其余填 0
-            miss_val = 0
-        else:                             # 当时只存了非 miss → 其余填 miss
-            miss_val = self.seq_depth - 1
-        dense[dense == 0] = miss_val      # 稀疏格式里“显式 0”就是没存的位置
+        # 3. 先变成 dense，此时“没存的位置”全是 0
+        dense = sub.toarray()          # shape (len(row_idx), n_variants)
+
+        # 4. 构造一个与 dense 同形状的“缺失掩码”
+        #    True 表示“当时没存”，需要回填
+        mask = np.ones_like(dense, dtype=bool)
+        # 把显式存的元素置 False
+        for i, row in enumerate(row_idx):
+            start = sub.indptr[i]
+            end   = sub.indptr[i + 1]
+            cols  = sub.indices[start:end]
+            mask[i, cols] = False
+
+        # 5. 按策略回填
+        if self.default_gt == 'ref':
+            # 没存的位置 → 参考型 0
+            dense[mask] = 0
+        else:  # default_gt == 'miss'
+            # 没存的位置 → 缺失
+            dense[mask] = self.seq_depth - 1
 
         return dense.astype(np.int8)
 

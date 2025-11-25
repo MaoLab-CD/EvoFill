@@ -12,6 +12,7 @@ import json
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+from functools import partial
 from sklearn.model_selection import train_test_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -33,7 +34,7 @@ PRETRAIN_DIR       = WORK_DIR / "pretrain"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 
 TEST_N_SAMPLES     = 128
-BATCH_SIZE         = 16
+BATCH_SIZE         = 32
 MIN_MASK_RATE      = 0.3
 MAX_MASK_RATE      = 0.7
 
@@ -96,21 +97,25 @@ test_ds = GenomicDataset(
     gt_enc, evo_mat=gt_enc.evo_mat, mask=False, indices=test_idx
 )
 
-def collate_fn(batch):
-    x = torch.stack([b[0] for b in batch])
-    y = torch.stack([b[1] for b in batch])
-    idx = [b[2] for b in batch]
-    evo = gt_enc.evo_mat[np.ix_(idx, idx)] if train_ds.evo_mat is not None else np.empty(0)
-    evo = torch.FloatTensor(evo) if evo.size else torch.empty(0)
-    return x, y, evo
+def collate_fn(batch, dataset):
+    x_onehot = torch.stack([item[0] for item in batch])
+    y_onehot = torch.stack([item[1] for item in batch])
+    real_idx_list = [item[2] for item in batch]
+
+    if dataset.evo_mat is not None:
+        evo_mat_batch = dataset.evo_mat[np.ix_(real_idx_list, real_idx_list)]
+        evo_mat_batch = torch.FloatTensor(evo_mat_batch)
+    else:
+        evo_mat_batch = torch.empty(0)
+    return x_onehot, y_onehot, evo_mat_batch
 
 train_loader = torch.utils.data.DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
-    num_workers=4, pin_memory=True, collate_fn=collate_fn
+    num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=train_ds)
 )
 test_loader = torch.utils.data.DataLoader(
     test_ds, batch_size=BATCH_SIZE, shuffle=False,
-    num_workers=4, pin_memory=True, collate_fn=collate_fn
+    num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=test_ds)
 )
 
 # -------------- 2. 模型 --------------
@@ -221,6 +226,15 @@ for cid in range(model.module.n_chunks):
             patience_counter += 1
             if patience_counter >= EARLYSTOP_PATIENCE:
                 pprint("Early stop!")
+                best_ckpt = torch.load(
+                    f"{MODEL_SAVE_DIR}/{MODEL_NAME}_chunk[{cid}].pth",
+                    map_location="cpu"
+                )
+                unwrapped = accelerator.unwrap_model(model)
+                unwrapped.chunk_embeds[cid].load_state_dict(best_ckpt["chunk_embed_state"])
+                unwrapped.chunk_modules[cid].load_state_dict(best_ckpt["chunk_module_state"])
+                unwrapped.global_out.load_state_dict(best_ckpt["global_out_state"])
+                pprint(f"  --> chunk {cid} best weights reloaded (early-stop)")
                 break
 
 # -------------- 7. 保存最终模型 --------------
