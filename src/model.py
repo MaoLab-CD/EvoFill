@@ -292,7 +292,7 @@ class UltraLongRangeMamba(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # ---- idx 嵌入 ----
-        self.idx_embed = nn.Embedding(total_sites, d_model // 2, sparse=True)
+        self.idx_embed = nn.Embedding(total_sites, d_model // 2) #, sparse=True
 
         # ---- 门控 ----
         self.gate_proj = nn.Sequential(
@@ -350,17 +350,10 @@ class GlobalOut(nn.Module):
             d_model=d_model,
             chunk_size=chunk_size,
             total_sites = total_sites,
-            threshold=0.05)
-
-    #     # -------------- 3) 开关 --------------
-    #     self.skip_ulr = True
-    #     self.set_ulr_enabled(False)
-
-    # # ============ 两阶段切换 ============
-    # def set_ulr_enabled(self, enabled: bool):
-    #     self.skip_ulr = not enabled
-    #     for p in self.ulr_mamba.parameters():
-    #         p.requires_grad = enabled
+            threshold=0.05,
+            d_state=64, d_conv=4, expand=2,
+            n_layers=2,
+            )
 
     # ============ 前向：ulr 是可插拔中间件 ============
     def forward(self, x, mask):
@@ -402,6 +395,8 @@ class GlobalOut(nn.Module):
 
     # ---------- 辅助 ----------
     def _band_conv1(self, x, w, b):
+        w = w.to(dtype=x.dtype)
+        b = b.to(dtype=x.dtype)
         return F.gelu(F.conv1d(x, w, b, padding=self.p))
 
 class EvoFill(nn.Module):
@@ -453,7 +448,8 @@ class EvoFill(nn.Module):
             x: torch.Tensor,                 # (B, L, n_alleles) one-hot
             chunk_id: Optional[Union[int, List[int]]] = None
             ):
-
+        if x.dtype != next(self.parameters()).dtype:
+            self.to(dtype=x.dtype)
         batch_size = x.shape[0]
         device = x.device
         if chunk_id is None:

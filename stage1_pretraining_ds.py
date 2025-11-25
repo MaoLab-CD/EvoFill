@@ -13,7 +13,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
-from torch.optim import SparseAdam, AdamW
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from accelerate import Accelerator
 from accelerate.utils import set_seed as accelerate_set_seed
@@ -51,11 +51,9 @@ SCHEDULER_MIN_LR   = 1e-8
 SEED               = 3047
 
 # 优化器专属
-SPARSE_LR          = 1e-3
-SPARSE_BETAS       = (0.9, 0.999)
-DENSE_LR           = 1e-3
-DENSE_BETAS        = (0.9, 0.999)
-DENSE_WD           = 1e-5
+LR          = 1e-3
+BETAS       = (0.9, 0.999)
+WD           = 1e-5
 # ==============================================
 
 # -------------- 工具：打印只在主进程 --------------
@@ -132,36 +130,18 @@ if accelerator.is_main_process:
         json.dump(meta, f, indent=4)
 
 # -------------- 3. 拆参数 → 双优化器 --------------
-sparse_params, dense_params = [], []
-for cid in range(model_raw.n_chunks):
-    dense_params.extend(model_raw.chunk_modules[cid].parameters())
-dense_params.extend([
-    model_raw.global_out.w1, model_raw.global_out.b1,
-    model_raw.global_out.w2, model_raw.global_out.b2
-])
-if hasattr(model_raw.global_out, 'ulr_mamba'):
-    for n, p in model_raw.global_out.ulr_mamba.named_parameters():
-        if 'idx_embed' in n:
-            sparse_params.append(p)
-        else:
-            dense_params.append(p)
 
-optim_sparse = SparseAdam(sparse_params, lr=SPARSE_LR, betas=SPARSE_BETAS) \
-               if sparse_params else None
-optim_dense  = AdamW(dense_params, lr=DENSE_LR, betas=DENSE_BETAS, weight_decay=DENSE_WD)
+optimizer = AdamW(model_raw.parameters(), lr=LR, betas=BETAS, weight_decay=WD)
 
-sched_sparse = ReduceLROnPlateau(optim_sparse, mode='min', factor=SCHEDULER_FACTOR,
-                                 patience=SCHEDULER_PATIENCE, min_lr=SCHEDULER_MIN_LR) \
-               if optim_sparse else None
-sched_dense  = ReduceLROnPlateau(optim_dense,  mode='min', factor=SCHEDULER_FACTOR,
+scheduler  = ReduceLROnPlateau(optimizer,  mode='min', factor=SCHEDULER_FACTOR,
                                  patience=SCHEDULER_PATIENCE, min_lr=SCHEDULER_MIN_LR)
 
 # -------------- 4. Accelerator 封装 --------------
 model, *opt_sch = accelerator.prepare(
-    model_raw, optim_sparse, optim_dense, sched_sparse, sched_dense,
+    model_raw, optimizer, scheduler,
     train_loader, test_loader
 )
-optim_sparse, optim_dense, sched_sparse, sched_dense = opt_sch[:4]
+optimizer, scheduler = opt_sch[:2]
 
 # -------------- 5. Loss --------------
 
@@ -172,12 +152,9 @@ for cid in range(model.module.n_chunks):
     pprint(f"\n=== Chunk {cid + 1}/{model_raw.n_chunks} ===")
 
     # ---- 只重置学习率，不新建 Accelerator ----
-    reset_lr(optim_sparse, SPARSE_LR)
-    reset_lr(optim_dense,  DENSE_LR)
+    reset_lr(optimizer, LR)
     # 如果用了 ReduceLROnPlateau，把内部计数器也清掉
-    if sched_sparse is not None:
-        sched_sparse.best = None          # 会强制下一次 step 重新记录“最佳”
-    sched_dense.best = None
+    scheduler.best = None
 
     best_loss = math.inf
     patience_counter = 0
@@ -193,18 +170,13 @@ for cid in range(model.module.n_chunks):
             x, y = x.to(device), y.to(device)
             evo = evo.to(device) if evo.numel() else None
 
-            if optim_sparse:
-                optim_sparse.zero_grad()
-            optim_dense.zero_grad()
+            optimizer.zero_grad()
 
             logits, prob, mask_idx = model(x, cid)
             loss, logs = criterion(logits[:, mask_idx], prob[:, mask_idx],
                                    y[:, mask_idx], evo)
             accelerator.backward(loss)
-
-            if optim_sparse:
-                optim_sparse.step()
-            optim_dense.step()
+            optimizer.step()
             tot_loss += loss.item()
             train_pbar.set_postfix({'loss': loss.item(), 'ce':logs['ce'], 'r2':logs['r2'], 'evo':logs['evo']})
 
@@ -224,13 +196,10 @@ for cid in range(model.module.n_chunks):
         avg_test_loss = tot_loss / len(test_loader)
 
         # scheduler
-        if sched_sparse:
-            sched_sparse.step(avg_test_loss)
-        sched_dense.step(avg_test_loss)
+        scheduler.step(avg_test_loss)
 
         pprint(f"Chunk {cid + 1}/{model.n_chunks}, Epoch {epoch + 1}/{MAX_EPOCHS}: train={avg_train_loss:.2f} test={avg_test_loss:.2f}  "
-               f"lr_dense={optim_dense.param_groups[0]['lr']:.2e}  "
-               f"lr_sparse={optim_sparse.param_groups[0]['lr']:.2e}" if optim_sparse else "")
+               f"lr={optimizer.param_groups[0]['lr']:.2e}  ")
 
         # ---- early stop ----
         if avg_test_loss < best_loss:

@@ -22,7 +22,11 @@ from src.data import GenotypeEncoder, GenomicDataset_Missing
 from src.model import EvoFill
 from src.loss import ImputationLoss_Missing
 
-# ================= 1. 超参数（可拎出去 config_stage3.py） =================
+# ================= 1. 超参数 =================
+# MODEL_NAME         = "chr22"
+# WORK_DIR           = Path('/data/home/7240203/EvoFill_data/1kGP_chr22')
+# MODEL_NAME         = "chr6"
+# WORK_DIR           = Path('/data/home/7240325/EvoFill_data/1kGP_chr6')
 MODEL_NAME         = "chr22_trim"
 WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251121_chr22_v2/')
 PRETRAIN_DIR       = WORK_DIR / "pretrain"   # 测试集来源
@@ -34,12 +38,11 @@ BATCH_SIZE         = 32
 MIN_MASK_RATE      = 0.3
 MAX_MASK_RATE      = 0.7
 
-
 CHUNK_SIZE         = 32768
 OVERLAP            = 1024
 D_MODEL            = 64
 D_STATE            = 64
-HEADDIM            = 128
+HEADDIM            = 64
 
 MAX_EPOCHS         = 1000
 EARLYSTOP_PATIENCE = 11
@@ -49,11 +52,9 @@ SCHEDULER_MIN_LR   = 1e-9
 SEED               = 3047
 
 # 优化器
-SPARSE_LR          = 1e-4
-SPARSE_BETAS       = (0.9, 0.999)
-DENSE_LR           = 1e-4
-DENSE_BETAS        = (0.9, 0.999)
-DENSE_WD           = 1e-6
+LR           = 1e-4
+BETAS        = (0.9, 0.999)
+WD           = 1e-6
 # ============================================================================
 
 def pprint(*args):
@@ -124,45 +125,34 @@ model_raw.load_state_dict(ckpt['model_state'])
 
 
 # -------------- 3. 只解冻 embedding + global_out --------------
-trainable_dense, trainable_sparse = [], []
+trainable_para= []
 # 3.1 GlobalOut 全部
 for name, p in model_raw.global_out.named_parameters():
-    if 'idx_embed' in name:
-        trainable_sparse.append(p)
-    else:
-        trainable_dense.append(p)
+        trainable_para.append(p)
 # 3.2 Chunk-Embedding
 for emb in model_raw.chunk_embeds:
     for p in emb.parameters():
-        trainable_dense.append(p)
+        trainable_para.append(p)
 
 # 先全部冻住
 for p in model_raw.parameters():
     p.requires_grad = False
 # 再放开需要的
-for p in trainable_dense + trainable_sparse:
+for p in trainable_para:
     p.requires_grad = True
 
-pprint(f"Trainable dense params: {len(trainable_dense)}")
-pprint(f"Trainable sparse params: {len(trainable_sparse)}")
-
 # -------------- 4. 双优化器 --------------
-optim_sparse = SparseAdam(trainable_sparse, lr=SPARSE_LR, betas=SPARSE_BETAS) \
-               if trainable_sparse else None
-optim_dense  = AdamW(trainable_dense, lr=DENSE_LR, betas=DENSE_BETAS, weight_decay=DENSE_WD)
+optimizer  = AdamW(trainable_para, lr=LR, betas=BETAS, weight_decay=WD)
 
-sched_sparse = ReduceLROnPlateau(optim_sparse, mode='min', factor=SCHEDULER_FACTOR,
-                                 patience=SCHEDULER_PATIENCE, min_lr=SCHEDULER_MIN_LR) \
-               if optim_sparse else None
-sched_dense  = ReduceLROnPlateau(optim_dense, mode='min', factor=SCHEDULER_FACTOR,
+scheduler  = ReduceLROnPlateau(optimizer, mode='min', factor=SCHEDULER_FACTOR,
                                  patience=SCHEDULER_PATIENCE, min_lr=SCHEDULER_MIN_LR)
 
 # -------------- 5. Accelerator 封装 --------------
 model, *opt_sch = accelerator.prepare(
-    model_raw, optim_sparse, optim_dense, sched_sparse, sched_dense,
+    model_raw, optimizer, scheduler,
     train_loader, test_loader
 )
-optim_sparse, optim_dense, sched_sparse, sched_dense = opt_sch[:4]
+optimizer, scheduler = opt_sch[:2]
 
 # -------------- 6. Loss --------------
 
@@ -185,18 +175,14 @@ for epoch in range(MAX_EPOCHS):
         x, y = x.to(device), y.to(device)
         evo = evo.to(device) if evo.numel() else None
 
-        if optim_sparse:
-            optim_sparse.zero_grad()
-        optim_dense.zero_grad()
+        optimizer.zero_grad()
 
         # 不分 chunk → cid=None
         logits, prob, mask_idx = model(x, None)
         loss, logs = criterion(logits[:, mask_idx], prob[:, mask_idx],
                                y[:, mask_idx], evo)
         accelerator.backward(loss)
-        if optim_sparse:
-            optim_sparse.step()
-        optim_dense.step()
+        optimizer.step()
         tot_loss += loss.item()
 
         train_pbar.set_postfix({'loss': loss.item(), 'ce':logs['ce'], 'r2':logs['r2'], 'evo':logs['evo']})
@@ -233,13 +219,10 @@ for epoch in range(MAX_EPOCHS):
     test_gts  = torch.cat(test_gts,  dim=0)
 
     # scheduler
-    if sched_sparse:
-        sched_sparse.step(avg_test_loss)
-    sched_dense.step(avg_test_loss)
+    scheduler.step(avg_test_loss)
 
     pprint(f"Epoch {epoch+1} / {MAX_EPOCHS}  aDNA={avg_train_loss:.3f}  test={avg_test_loss:.3f}  "
-           f"lr_dense={optim_dense.param_groups[0]['lr']:.2e}  "
-           f"lr_sparse={optim_sparse.param_groups[0]['lr']:.2e}" if optim_sparse else "")
+           f"lr={optimizer.param_groups[0]['lr']:.2e}  ")
 
     # ---- early stop ----
     if avg_test_loss < best_loss:
