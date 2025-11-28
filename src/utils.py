@@ -88,24 +88,38 @@ def precompute_maf(gts_np, mask_int=-1):
     return maf, bin_cnt
 
 def build_geno3_map_from_hapmap(hap_map: dict) -> np.ndarray:
-    sorted_items = sorted(hap_map.items(), key=lambda kv: kv[1])
-    three_class = []
-    for gt, idx in sorted_items:
+    # 定义一个映射：从基因型到分类
+    gt_to_class = {}
+    for gt in hap_map.keys():
         if gt in ('.|.', './.'):
             continue
         sep = '|' if '|' in gt else ('/' if '/' in gt else None)
-        a, b = (gt.split(sep) if sep else (gt, gt))
+        a, b = gt.split(sep) if sep else (gt, gt)
         try:
             ai, bi = int(a), int(b)
         except Exception:
-            three_class.append(1); continue
+            gt_to_class[gt] = 1
+            continue
         if ai == bi == 0:
-            three_class.append(0)
+            gt_to_class[gt] = 0
         elif ai != bi:
-            three_class.append(1)
+            gt_to_class[gt] = 1
         else:
-            three_class.append(2)
-    return np.array(three_class, dtype=np.int64)
+            gt_to_class[gt] = 2
+
+    # 确保输出顺序为 [0, 1, 2]
+    result = []
+    for cls in [0, 1, 2]:
+        found = False
+        for gt, c in gt_to_class.items():
+            if c == cls:
+                result.append(c)
+                found = True
+                break
+        if not found:
+            raise ValueError(f"Missing class {cls} in hap_map")
+
+    return np.array(result, dtype=np.int64)
 
 # ---------- 2. 线程安全缓存 ----------
 MAF_BINS = [(0.00, 0.05), (0.05, 0.10), (0.10, 0.20),

@@ -20,23 +20,23 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed as accelerate_set_seed
 
 from src.model import EvoFill
-from src.data import GenotypeEncoder, GenomicDataset
-from src.loss import ImputationLoss
+from src.data import GenotypeEncoder, GenomicDataset_Missing
+from src.loss import ImputationLoss_Missing
 
 # ================= 1. 超参数 =================
 # MODEL_NAME         = "chr22"
 # WORK_DIR           = Path('/data/home/7240203/EvoFill_data/1kGP_chr22')
 # MODEL_NAME         = "chr6"
 # WORK_DIR           = Path('/data/home/7240325/EvoFill_data/1kGP_chr6')
-MODEL_NAME         = "aadr_chr22"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251125_chr22/')
-PRETRAIN_DIR       = WORK_DIR / "pretrain"
+MODEL_NAME         = "chr22_trim"
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251121_chr22_v2/')
+PRETRAIN_DIR       = WORK_DIR / "fulltrain"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 
 TEST_N_SAMPLES     = 128
 BATCH_SIZE         = 32
-MIN_MASK_RATE      = 0.05
-MAX_MASK_RATE      = 0.95
+MIN_MASK_RATE      = 0.3
+MAX_MASK_RATE      = 0.7
 
 CHUNK_SIZE         = 32768
 OVERLAP            = 1024
@@ -88,11 +88,11 @@ train_idx, test_idx = train_test_split(
     shuffle=True,
 )
 
-train_ds = GenomicDataset(
+train_ds = GenomicDataset_Missing(
     gt_enc, evo_mat=gt_enc.evo_mat, mask=True,
     masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE), indices=train_idx
 )
-test_ds = GenomicDataset(
+test_ds = GenomicDataset_Missing(
     gt_enc, evo_mat=gt_enc.evo_mat, mask=False, indices=test_idx
 )
 
@@ -149,7 +149,8 @@ optimizer, scheduler = opt_sch[:2]
 
 # -------------- 5. Loss --------------
 
-criterion = ImputationLoss(use_r2=True, use_evo=True, r2_weight=1, evo_weight=4, evo_lambda=10)
+criterion = ImputationLoss_Missing(use_r2=True, use_evo=False)
+criterion = ImputationLoss_Missing(use_r2=True, use_evo=True, r2_weight=1, evo_weight=4, evo_lambda=10)
 
 # -------------- 6. 训练 --------------
 for cid in range(model.module.n_chunks):

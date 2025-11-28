@@ -29,8 +29,8 @@ from src.loss import ImputationLoss
 # MODEL_NAME         = "chr6"
 # WORK_DIR           = Path('/data/home/7240325/EvoFill_data/1kGP_chr6')
 MODEL_NAME         = "aadr_chr22"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251125_chr22/')
-PRETRAIN_DIR       = WORK_DIR / "pretrain"
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251127_chr22/')
+TRAIN_DIR          = WORK_DIR / "posttrain"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 
 TEST_N_SAMPLES     = 128
@@ -45,16 +45,16 @@ D_STATE            = 64
 HEADDIM            = 64
 
 MAX_EPOCHS         = 1000
-EARLYSTOP_PATIENCE = 11
+EARLYSTOP_PATIENCE = 21
 SCHEDULER_FACTOR   = 0.5
 SCHEDULER_PATIENCE = 5
-SCHEDULER_MIN_LR   = 1e-8
+SCHEDULER_MIN_LR   = 1e-9
 SEED               = 3047
 
 # 优化器专属
-LR          = 1e-3
+LR          = 5e-4
 BETAS       = (0.9, 0.999)
-WD           = 1e-5
+WD          = 1e-6
 # ==============================================
 
 # -------------- 工具：打印只在主进程 --------------
@@ -78,7 +78,7 @@ accelerate_set_seed(SEED)
 SCHEDULER_PATIENCE = SCHEDULER_PATIENCE * world_size
 # -------------- 1. 数据 --------------
 
-gt_enc = GenotypeEncoder.loadfromdisk(PRETRAIN_DIR)
+gt_enc = GenotypeEncoder.loadfromdisk(TRAIN_DIR)
 pprint(f"{gt_enc.n_samples:,} samples, {gt_enc.n_variants:,} variants, {gt_enc.seq_depth} seq-depth.")
 
 train_idx, test_idx = train_test_split(
@@ -120,18 +120,8 @@ test_loader = torch.utils.data.DataLoader(
 # -------------- 2. 模型 --------------
 
 model_raw = EvoFill(gt_enc.seq_depth, gt_enc.n_variants, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM)
-
-if accelerator.is_main_process:
-    meta = {"model_name":  MODEL_NAME,
-            "alleles":     gt_enc.seq_depth,
-            "total_sites": gt_enc.n_variants,
-            "chunk_size":  CHUNK_SIZE,
-            "overlap":     OVERLAP,
-            "d_model":     D_MODEL,
-            "d_state":     D_STATE,
-            "headdim":     HEADDIM,}
-    with open(MODEL_SAVE_DIR / "model_meta.json", "w") as f:
-        json.dump(meta, f, indent=4)
+ckpt = torch.load(f'{MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth', map_location='cpu')
+model_raw.load_state_dict(ckpt['model_state'])
 
 # -------------- 3. 拆参数 → 双优化器 --------------
 
@@ -246,5 +236,5 @@ final_ckpt = {
     "chunk_overlap": unwrapped.chunk_overlap,
 }
 if accelerator.is_main_process:
-    accelerator.save(final_ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth")
-    pprint(f"==> STAGE1 finished: {MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth")
+    accelerator.save(final_ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_stage2.pth")
+    pprint(f"==> STAGE1 finished: {MODEL_SAVE_DIR}/{MODEL_NAME}_stage2.pth")

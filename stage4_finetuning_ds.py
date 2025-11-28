@@ -7,14 +7,13 @@ DeepSpeed ZeRO-3 多卡并行
 运行：
     accelerate launch --config_file ds_zero3.yaml train_stage3_deepspeed.py
 """
-import math
 import torch
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from sklearn.model_selection import KFold
-from torch.optim import SparseAdam, AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from functools import partial
+from torch.optim import  AdamW
 from accelerate import Accelerator
 from accelerate.utils import set_seed as accelerate_set_seed
 
@@ -28,9 +27,9 @@ from src.loss import ImputationLoss
 # WORK_DIR           = Path('/data/home/7240203/EvoFill_data/1kGP_chr22')
 # MODEL_NAME         = "chr6"
 # WORK_DIR           = Path('/data/home/7240325/EvoFill_data/1kGP_chr6')
-MODEL_NAME         = "chr22_trim"
+MODEL_NAME         = "aadr_chr22"
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251125_chr22/')
 stage4_tag         = "CDX_BEB_ASW"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251121_chr22_v2/')
 PRETRAIN_DIR       = WORK_DIR / "pretrain"
 AUGMENT_DIR        = WORK_DIR / "augment"
 FINETUNE_DIR        = WORK_DIR / "finetune"
@@ -38,8 +37,8 @@ MODEL_SAVE_DIR     = WORK_DIR / "models"
 
 K_FOLD             = 5
 BATCH_SIZE         = 4
-MIN_MASK_RATE      = 0.3
-MAX_MASK_RATE      = 0.7
+MIN_MASK_RATE      = 0.7
+MAX_MASK_RATE      = 0.95
 
 CHUNK_SIZE         = 32768
 OVERLAP            = 1024
@@ -54,9 +53,9 @@ EARLYSTOP_PATIENCE = 11
 SEED               = 3047
 
 # 优化器
-LR           = 1e-4
+LR           = 1e-5
 BETAS        = (0.9, 0.999)
-WD           = 1e-6
+WD           = 1e-7
 # ============================================================================
 
 def pprint(*args):
@@ -73,40 +72,42 @@ EARLYSTOP_PATIENCE = EARLYSTOP_PATIENCE * world_size
 # -------------- 1. 数据 --------------
 gt_enc_urp = GenotypeEncoder.loadfromdisk(FINETUNE_DIR)
 
-def collate_fn(batch):
-    x = torch.stack([b[0] for b in batch])
-    y = torch.stack([b[1] for b in batch])
-    idx = [b[2] for b in batch]
-    if gt_enc_urp.evo_mat is not None:
-        evo = gt_enc_urp.evo_mat[np.ix_(idx, idx)]
-        evo = torch.FloatTensor(evo)
+def collate_fn(batch, dataset):
+    x_onehot = torch.stack([item[0] for item in batch])
+    y_onehot = torch.stack([item[1] for item in batch])
+    real_idx_list = [item[2] for item in batch]
+
+    if dataset.evo_mat is not None:
+        evo_mat_batch = dataset.evo_mat[np.ix_(real_idx_list, real_idx_list)]
+        evo_mat_batch = torch.FloatTensor(evo_mat_batch)
     else:
-        evo = torch.empty(0)
-    return x, y, evo
+        evo_mat_batch = torch.empty(0)
+    return x_onehot, y_onehot, evo_mat_batch
 
 # -------------- 2. 模型 --------------
 
-model_raw = EvoFill(gt_enc_urp.seq_depth, gt_enc_urp.n_variants, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM)
+model = EvoFill(gt_enc_urp.seq_depth, gt_enc_urp.n_variants, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM)
 ckpt = torch.load(f'{MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth', map_location='cpu')
-model_raw.load_state_dict(ckpt['model_state'])
+model.load_state_dict(ckpt['model_state'])
 
 # -------------- 3. 只解冻 embedding + global_out --------------
 trainable_para= []
 # 3.1 GlobalOut 全部
-for name, p in model_raw.global_out.named_parameters():
+for name, p in model.global_out.named_parameters():
         trainable_para.append(p)
 # 3.2 Chunk-Embedding
-for emb in model_raw.chunk_embeds:
+for emb in model.chunk_embeds:
     for p in emb.parameters():
         trainable_para.append(p)
 
 # 先全部冻住
-for p in model_raw.parameters():
+for p in model.parameters():
     p.requires_grad = False
 # 再放开需要的
 for p in trainable_para:
     p.requires_grad = True
 
+print("Trainable params:", len(trainable_para))
 # -------------- 4. 优化器 --------------
 optimizer  = AdamW(trainable_para, lr=LR, betas=BETAS, weight_decay=WD)
 
@@ -118,6 +119,14 @@ def lr_lambda(epoch):
 
 scheduler  = torch.optim.lr_scheduler.LambdaLR(optimizer,  lr_lambda)
 
+train_ds = GenomicDataset(
+        gt_enc_urp, evo_mat=gt_enc_urp.evo_mat,mask=True,
+        masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE), indices=None)
+train_loader = torch.utils.data.DataLoader(
+    train_ds, batch_size=BATCH_SIZE, shuffle=True,
+    num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=train_ds))
+
+model, optimizer, scheduler, train_loader = accelerator.prepare(model, optimizer, scheduler, train_loader)
 
 # -------------- 6. Loss --------------
 
@@ -147,15 +156,13 @@ for epoch in range(MAX_EPOCHS):
 
         train_loader = torch.utils.data.DataLoader(
             train_ds, batch_size=BATCH_SIZE, shuffle=True,
-            num_workers=4, pin_memory=True, collate_fn=collate_fn)
+            num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=train_ds))
         val_loader   = torch.utils.data.DataLoader(
             val_ds,   batch_size=BATCH_SIZE, shuffle=False,
-            num_workers=4, pin_memory=True, collate_fn=collate_fn)
+            num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=val_ds))
 
         # 每折重新 prepare（折内并行）
-        model, optimizer, scheduler, train_loader, val_loader = \
-            accelerator.prepare(model_raw, optimizer, scheduler, 
-                                train_loader, val_loader)
+        train_loader, val_loader = accelerator.prepare(train_loader, val_loader)
 
         # ---- 训练 ----
         model.train()

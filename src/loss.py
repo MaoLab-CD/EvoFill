@@ -172,21 +172,28 @@ class ImputationLoss_Missing(nn.Module):
             GROUP_SIZE = 4
             N_FULL_GROUPS = BATCH_SIZE // GROUP_SIZE
             if N_FULL_GROUPS > 0:
+                # 重塑成 (G, G_SIZE, L, C+1) 和 (G, G_SIZE, L, C)
                 y_true_grp = y_true[:N_FULL_GROUPS * GROUP_SIZE].view(
                     N_FULL_GROUPS, GROUP_SIZE, N_LOCUS, N_CLASS_FULL)
                 prob_grp = prob[:N_FULL_GROUPS * GROUP_SIZE].view(
                     N_FULL_GROUPS, GROUP_SIZE, N_LOCUS, N_CLASS)
-
                 r2_sum = 0.
                 for g in range(N_FULL_GROUPS):
-                    # 非缺失掩码 (N_LOCUS,)
-                    nonmiss = (y_true_grp[g].argmax(-1) != N_CLASS).any(0)
-                    # 计算 AF（仅非缺失）
+                    # 1) 非缺失掩码 (GROUP_SIZE, N_LOCUS)
+                    nonmiss_mask = (y_true_grp[g].argmax(-1) != N_CLASS)
+                    # 2) 该位点非缺失样本数  (N_LOCUS,)
+                    nonmiss_cnt = nonmiss_mask.sum(0).float()
+                    # 3) ALT 计数  (N_LOCUS,)
                     alt_cnt = y_true_grp[g, :, :, 1:N_CLASS].sum((0, 2))
-                    af = alt_cnt / (GROUP_SIZE * nonmiss.sum().float()).clamp_min(1)
-                    # 预测 ALT 剂量
-                    pred_alt = prob_grp[g, :, :, 1:N_CLASS].sum(-1).mean(0)
-                    r2_sum += -self._calculate_minimac_r2(pred_alt, af, ~nonmiss).sum() * GROUP_SIZE
+                    # 4) 真实 ALT 频率
+                    af = alt_cnt / nonmiss_cnt.clamp_min(1)
+                    # 5) 预测 ALT 剂量
+                    pred_alt = prob_grp[g, :, :, 1:N_CLASS].sum(-1)  # (G_SIZE, L)
+                    pred_alt = pred_alt.mean(0)                      # (L,)
+                    # 6) 计算 R²
+                    r2_sum += -self._calculate_minimac_r2(
+                        pred_alt, af, ~nonmiss_mask).sum() * GROUP_SIZE
+
                 r2_loss = self.r2_weight * r2_sum / BATCH_SIZE
 
         # 3. 演化损失

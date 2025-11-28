@@ -9,6 +9,7 @@ DeepSpeed ZeRO-3 多卡并行
 """
 import math
 import torch
+import json
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -29,12 +30,12 @@ from src.loss import ImputationLoss_Missing
 # MODEL_NAME         = "chr6"
 # WORK_DIR           = Path('/data/home/7240325/EvoFill_data/1kGP_chr6')
 MODEL_NAME         = "aadr_chr22"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251125_chr22/')
-PRETRAIN_DIR       = WORK_DIR / "pretrain"   # 测试集来源
-AUGMENT_DIR        = WORK_DIR / "posttrain"      ### Stage-3 差异：增强数据
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251127_chr22/')
+TEST_DIR           = WORK_DIR / "posttrain"       # 测试集来源: 30% 1KGP
+TRAIN_DIR          = WORK_DIR / "pretrain"      #
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 
-TEST_RATIO         = 0.30                    ### Stage-3 差异：30% 预训练样本做测试
+TEST_RATIO         = 0.30 
 BATCH_SIZE         = 32
 MIN_MASK_RATE      = 0.1              # 假设古DNA样本本身有 50% 缺失
 MAX_MASK_RATE      = 0.4
@@ -73,8 +74,8 @@ EARLYSTOP_PATIENCE = EARLYSTOP_PATIENCE * world_size
 # -------------- 1. 数据 --------------
 
 # ### Stage-3 差异：训练集=augment，测试集=pretrain 随机 30%
-gt_enc_train = GenotypeEncoder.loadfromdisk(AUGMENT_DIR)
-gt_enc_test  = GenotypeEncoder.loadfromdisk(PRETRAIN_DIR)
+gt_enc_train = GenotypeEncoder.loadfromdisk(TRAIN_DIR)
+gt_enc_test  = GenotypeEncoder.loadfromdisk(TEST_DIR)
 
 assert gt_enc_train.seq_depth  == gt_enc_test.seq_depth
 assert gt_enc_train.n_variants == gt_enc_test.n_variants
@@ -128,7 +129,17 @@ test_loader = torch.utils.data.DataLoader(
 model_raw = EvoFill(ALLELES, TOTAL_SITES, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM)
 # ckpt = torch.load(f'{MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth', map_location='cpu')
 # model_raw.load_state_dict(ckpt['model_state'])
-
+if accelerator.is_main_process:
+    meta = {"model_name":  MODEL_NAME,
+            "alleles":     ALLELES,
+            "total_sites": TOTAL_SITES,
+            "chunk_size":  CHUNK_SIZE,
+            "overlap":     OVERLAP,
+            "d_model":     D_MODEL,
+            "d_state":     D_STATE,
+            "headdim":     HEADDIM,}
+    with open(MODEL_SAVE_DIR / "model_meta.json", "w") as f:
+        json.dump(meta, f, indent=4)
 
 # -------------- 3. 只解冻 embedding + global_out --------------
 # trainable_para= []
@@ -244,8 +255,8 @@ for epoch in range(MAX_EPOCHS):
             "best_test_loss": best_loss,
         }
         if accelerator.is_main_process:
-            accelerator.save(ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_stage3.pth")
-            pprint(f"  --> updated {MODEL_NAME}_stage3.pth")
+            accelerator.save(ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth")
+            pprint(f"  --> updated {MODEL_NAME}_stage1.pth")
     else:
         patience_counter += 1
         if patience_counter >= EARLYSTOP_PATIENCE:
@@ -255,4 +266,4 @@ for epoch in range(MAX_EPOCHS):
 # -------------- 8. 最终保存 --------------
 accelerator.wait_for_everyone()
 if accelerator.is_main_process:
-    pprint(f"==> STAGE3 finished: {MODEL_SAVE_DIR}/{MODEL_NAME}_stage3.pth")
+    pprint(f"==> STAGE3 finished: {MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth")
