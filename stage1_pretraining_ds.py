@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Stage-1 训练脚本
-DeepSpeed ZeRO-3 多卡并行 + 双优化器（SparseAdam / AdamW）
+DeepSpeed ZeRO-3 多卡并行
 运行：
     OMP_NUM_THREADS=8 accelerate launch --config_file ds_zero3.yaml train_stage1_deepspeed.py
 """
@@ -28,17 +28,17 @@ from src.loss import ImputationLoss
 # WORK_DIR           = Path('/data/home/7240203/EvoFill_data/1kGP_chr22')
 # MODEL_NAME         = "chr6"
 # WORK_DIR           = Path('/data/home/7240325/EvoFill_data/1kGP_chr6')
-MODEL_NAME         = "aadr_chr22"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251125_chr22/')
-PRETRAIN_DIR       = WORK_DIR / "pretrain"
+MODEL_NAME         = "hg38_chr22"
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/1kGP_chr22')
+PRETRAIN_DIR       = WORK_DIR / "train"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 
 TEST_N_SAMPLES     = 128
-BATCH_SIZE         = 32
+BATCH_SIZE         = 16
 MIN_MASK_RATE      = 0.05
 MAX_MASK_RATE      = 0.95
 
-CHUNK_SIZE         = 32768
+CHUNK_SIZE         = 65536
 OVERLAP            = 1024
 D_MODEL            = 64
 D_STATE            = 64
@@ -152,99 +152,72 @@ optimizer, scheduler = opt_sch[:2]
 criterion = ImputationLoss(use_r2=True, use_evo=True, r2_weight=1, evo_weight=4, evo_lambda=10)
 
 # -------------- 6. 训练 --------------
-for cid in range(model.module.n_chunks):
-    pprint(f"\n=== Chunk {cid + 1}/{model_raw.n_chunks} ===")
+best_loss = math.inf
+patience_counter = 0
 
-    # ---- 只重置学习率，不新建 Accelerator ----
-    reset_lr(optimizer, LR)
-    # 如果用了 ReduceLROnPlateau，把内部计数器也清掉
-    scheduler.best = None
+for epoch in range(MAX_EPOCHS):
+    # ---- train ----
+    model.train()
+    tot_loss = 0.0
+    train_pbar = tqdm(train_loader, disable=not accelerator.is_main_process,
+                      desc=f'Epoch {epoch + 1}/{MAX_EPOCHS}')
+    for _, (x, y, evo) in enumerate(train_pbar):
+        x, y = x.to(device), y.to(device)
+        evo = evo.to(device) if evo.numel() else None
 
-    best_loss = math.inf
-    patience_counter = 0
-
-    for epoch in range(MAX_EPOCHS):
-        # ---- train ----
-        model.train()
-        tot_loss = 0.0
-        train_pbar = tqdm(train_loader, disable=not accelerator.is_main_process,
-                              desc=f'Chunk {cid + 1}/{model.n_chunks}, '
-                                   f'Epoch {epoch + 1}/{MAX_EPOCHS}')
-        for _, (x, y, evo) in enumerate(train_pbar):
-            x, y = x.to(device), y.to(device)
-            evo = evo.to(device) if evo.numel() else None
-
+        # 一个 batch 内按 chunk 顺序 forward
+        batch_loss = 0.0
+        for cid in range(model.module.n_chunks):
             optimizer.zero_grad()
-
             logits, prob, mask_idx = model(x, cid)
             loss, logs = criterion(logits[:, mask_idx], prob[:, mask_idx],
                                    y[:, mask_idx], evo)
             accelerator.backward(loss)
             optimizer.step()
-            tot_loss += loss.item()
-            train_pbar.set_postfix({'loss': loss.item(), 'ce':logs['ce'], 'r2':logs['r2'], 'evo':logs['evo']})
+            batch_loss += loss.item()
 
-        avg_train_loss = tot_loss / len(train_loader)
+        avg_batch_loss = batch_loss / model.module.n_chunks
+        tot_loss += avg_batch_loss
+        train_pbar.set_postfix({'loss': avg_batch_loss,
+                                'ce': logs['ce'], 'r2': logs['r2'], 'evo': logs['evo']})
 
-        # ---- eval ----
-        model.eval()
-        tot_loss = 0.0
-        with torch.no_grad():
-            for x, y, evo in test_loader:
-                x, y = x.to(device), y.to(device)
-                evo = evo.to(device) if evo.numel() else None
+    avg_train_loss = tot_loss / len(train_loader)
+
+    # ---- eval ----
+    model.eval()
+    tot_loss = 0.0
+    with torch.no_grad():
+        for x, y, evo in test_loader:
+            x, y = x.to(device), y.to(device)
+            evo = evo.to(device) if evo.numel() else None
+            batch_loss = 0.0
+            for cid in range(model.module.n_chunks):
                 logits, prob, mask_idx = model(x, cid)
                 loss, _ = criterion(logits[:, mask_idx], prob[:, mask_idx],
                                     y[:, mask_idx], evo)
-                tot_loss += loss.item()
-        avg_test_loss = tot_loss / len(test_loader)
+                batch_loss += loss.item()
+            tot_loss += batch_loss / model.module.n_chunks
+    avg_test_loss = tot_loss / len(test_loader)
 
-        # scheduler
-        scheduler.step(avg_test_loss)
+    # scheduler / early-stop 保持不变
+    scheduler.step(avg_test_loss)
+    pprint(f"Epoch {epoch + 1}/{MAX_EPOCHS}: train={avg_train_loss:.2f} "
+           f"test={avg_test_loss:.2f} lr={optimizer.param_groups[0]['lr']:.2e} pat={patience_counter}")
 
-        pprint(f"Chunk {cid + 1}/{model.n_chunks}, Epoch {epoch + 1}/{MAX_EPOCHS}: train={avg_train_loss:.2f} test={avg_test_loss:.2f}  "
-               f"lr={optimizer.param_groups[0]['lr']:.2e}  pat={patience_counter}")
-
-        # ---- early stop ----
-        if avg_test_loss < best_loss:
-            best_loss = avg_test_loss
-            patience_counter = 0
-            accelerator.wait_for_everyone()
-            unwrapped = accelerator.unwrap_model(model)
-            ckpt = {
-                "chunk_id": cid,
-                "chunk_embed_state": unwrapped.chunk_embeds[cid].state_dict(),
-                "chunk_module_state": unwrapped.chunk_modules[cid].state_dict(),
-                "global_out_state": unwrapped.global_out.state_dict(),
-                "best_test_loss": best_loss,
-            }
-            if accelerator.is_main_process:
-                accelerator.save(ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_chunk[{cid}].pth")
-                pprint(f"  --> updated {MODEL_NAME}_chunk[{cid}].pth")
-        else:
-            patience_counter += 1
-            if patience_counter >= EARLYSTOP_PATIENCE:
-                pprint("Early stop!")
-                best_ckpt = torch.load(
-                    f"{MODEL_SAVE_DIR}/{MODEL_NAME}_chunk[{cid}].pth",
-                    map_location="cpu"
-                )
-                unwrapped = accelerator.unwrap_model(model)
-                unwrapped.chunk_embeds[cid].load_state_dict(best_ckpt["chunk_embed_state"])
-                unwrapped.chunk_modules[cid].load_state_dict(best_ckpt["chunk_module_state"])
-                unwrapped.global_out.load_state_dict(best_ckpt["global_out_state"])
-                pprint(f"  --> chunk {cid} best weights reloaded (early-stop)")
-                break
+    if avg_test_loss < best_loss:
+        best_loss = avg_test_loss
+        patience_counter = 0
+        accelerator.wait_for_everyone()
+        unwrapped = accelerator.unwrap_model(model)
+        ckpt = {"model_state": unwrapped.state_dict(),
+                "best_test_loss": best_loss}
+        if accelerator.is_main_process:
+            accelerator.save(ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth")
+    else:
+        patience_counter += 1
+        if patience_counter >= EARLYSTOP_PATIENCE:
+            pprint("Early stop!")
+            break
 
 # -------------- 7. 保存最终模型 --------------
 accelerator.wait_for_everyone()
-unwrapped = accelerator.unwrap_model(model)
-final_ckpt = {
-    "model_state": unwrapped.state_dict(),
-    "n_chunks": unwrapped.n_chunks,
-    "chunk_size": unwrapped.chunk_size,
-    "chunk_overlap": unwrapped.chunk_overlap,
-}
-if accelerator.is_main_process:
-    accelerator.save(final_ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth")
-    pprint(f"==> STAGE1 finished: {MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth")

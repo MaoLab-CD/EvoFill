@@ -22,7 +22,7 @@ class GenotypeEncoder:
         self.save_dir = save_dir
         # 其余占位
         self.hap_map: Dict[str, int] = {}
-        self.default_gt = None
+        # self.default_gt = None
         self.seq_depth: Optional[int] = None
         self.n_samples = 0
         self.n_variants = 0
@@ -32,7 +32,7 @@ class GenotypeEncoder:
         self.evo_mat: Optional[np.ndarray] = None
 
     # ========= 2. 首次编码：建立标准 =========
-    def encode_new(self, vcf_path: str, default_gt: str, evo_mat: Optional[str] = None,):
+    def encode_new(self, vcf_path: str, evo_mat: Optional[str] = None,):
         """第一次编码，允许新建 hap_map 与 seq_depth"""
         self.vcf_path = vcf_path
         # 清空头一次可能遗留的参照
@@ -41,7 +41,7 @@ class GenotypeEncoder:
         self.evo_mat_path = evo_mat
         self.phased = self.phased if self.evo_mat_path is None else False
         # 真正干活
-        self.X_gt = self._load_gt(default_gt)
+        self.X_gt = self._load_gt()
         self.evo_mat = self._load_evo_mat() if self.evo_mat_path else None
 
         self.seq_depth = self.X_gt.data.max() + 2 # 0=ref; -1=miss; 1,2,..=alt
@@ -57,7 +57,7 @@ class GenotypeEncoder:
         return self
 
     # ========= 3. 参照编码：必须 100 % 一致 =========
-    def encode_ref(self, ref_meta_json: str, vcf_path: str, default_gt: str, evo_mat: Optional[str] = None):
+    def encode_ref(self, ref_meta_json: str, vcf_path: str, evo_mat: Optional[str] = None):
         """按已有 meta 编码新 VCF，任何不一致都抛异常"""
         if not os.path.isfile(ref_meta_json):
             raise FileNotFoundError(ref_meta_json)
@@ -76,7 +76,7 @@ class GenotypeEncoder:
 
         # 编码
         self.vcf_path = vcf_path
-        self.X_gt = self._load_gt(default_gt)
+        self.X_gt = self._load_gt()
 
         self.evo_mat_path = evo_mat
         self.evo_mat = self._load_evo_mat() if self.evo_mat_path else None
@@ -157,54 +157,28 @@ class GenotypeEncoder:
                 self.hap_map[sep.join(sorted(['.', '.']))] = -1
             return out
 
-    # ========= 5. 内部方法 =========
-    def _load_gt(self, default_gt):
-        self.default_gt = default_gt
-        if self.default_gt not in {'ref', 'miss'}:
-            raise ValueError('default_gt must be "ref" or "miss"')
-
-        interval = 10_000
-        row, col, data = [], [], []          # COO 三件套
+    def _load_gt(self):
+        interval = 10000
+        cols, data, indptr = [], [], [0]
         vcf = VCF(self.vcf_path, gts012=self.gts012)
         self.sample_ids = vcf.samples
         self.n_samples = len(self.sample_ids)
         self.n_variants = 0
         self.variant_ids = []
-
-        # 预计算行号偏移（phased 时每个样本占两行）
-        n_base_rows = 2 * self.n_samples if self.phased else self.n_samples
-
         for rec in vcf:
             vec = self._encode_gt(rec, phase=self.phased, gts012=self.gts012)
-
-            # 与原来完全相同的掩码逻辑
-            if self.default_gt == 'ref':
-                nz_mask = vec != 0                   # 保留 alt 和缺失
-            else:
-                nz_mask = vec != -1                  # 保留非缺失
-
-            nz_idx = np.flatnonzero(nz_mask)         # 非零元素在 vec 中的位置
-            val = vec[nz_idx]                        # 对应的基因型值
-            n_nz = len(nz_idx)
-
-            # 列号就是当前位点索引
-            col.extend([self.n_variants] * n_nz)
-            # 行号就是 nz_idx 本身（phased 时已经展开成 2*n_samples）
-            row.extend(nz_idx.tolist())
-            data.extend(val.tolist())
-
+            nz_idx = np.flatnonzero(vec)
+            cols.extend(nz_idx)
+            data.extend(vec[nz_idx])
+            indptr.append(indptr[-1] + len(nz_idx))
             self.n_variants += 1
             self.variant_ids.append(f"{rec.CHROM}:{rec.POS}_{rec.REF}/{','.join(rec.ALT)}")
-
             if self.n_variants % interval == 0:
                 print(f'\r[DATA] 已编码 {self.n_variants:,} 个位点', end='', flush=True)
         print(f'\r[DATA] 总计 {self.n_variants:,} 个位点  ', flush=True)
         vcf.close()
-
-        # 一次性建成 COO 矩阵
-        M = sp.coo_matrix((data, (row, col)),
-                        shape=(n_base_rows, self.n_variants),
-                        dtype=np.int8)
+        n_rows = 2 * self.n_samples if self.phased else self.n_samples
+        M = sp.csc_matrix((data, cols, indptr), shape=(n_rows, self.n_variants), dtype=np.int8)
         return M
 
     def _load_evo_mat(self):
@@ -236,7 +210,7 @@ class GenotypeEncoder:
             "evo_mat": str(self.evo_mat_path),
             "phased": str(self.phased),
             "gts012": str(self.gts012),
-            "default_gt": str(self.default_gt),
+            # "default_gt": str(self.default_gt),
             "n_samples": str(self.n_samples),
             "n_variants": str(self.n_variants),
             "seq_depth": str(self.seq_depth),
@@ -257,6 +231,7 @@ class GenotypeEncoder:
                 f.write(vid + "\n")
         print(f"[DATA] 结果已写入 {self.save_dir}")
 
+
     def gts_toarray(self, idx=None):
         """
         把稀疏矩阵还原成 dense 数组。
@@ -270,45 +245,21 @@ class GenotypeEncoder:
         返回值
         ------
         dense : ndarray, dtype=int8
-            缺失值 = -1 后转 seq_depth-1，参考型 = 0，alt = 原值
+            缺失值 = seq_depth-1，参考型 = 0，alt = 原值
         """
-        X = self.X_gt.tocoo()
-        n_var = self.n_variants
-        n_row = X.shape[0]
-
-        # 1. 统一行索引
+        # 1. 统一成“行索引数组”
         if idx is None:
-            row_idx = np.arange(n_row, dtype=int)
+            row_idx = np.arange(self.X_gt.shape[0])
         elif np.isscalar(idx):
             row_idx = np.array([idx], dtype=int)
         else:
             row_idx = np.asarray(idx, dtype=int)
 
-        # 2. 底板：先全填“缺省值”
-        if self.default_gt == 'ref':
-            dense = np.zeros((len(row_idx), n_var), dtype=np.int8)   # 缺省 0
-        else:  # miss
-            dense = np.full((len(row_idx), n_var), -1, dtype=np.int8)  # 缺省 -1
+        # 2. 拿子矩阵
+        sub = self.X_gt[row_idx]          # scipy 支持 fancy indexing
+        dense = sub.toarray()             # 形状 (len(row_idx), n_variants)
 
-        # 3. 建立“请求行”→“dense 行号”映射
-        row_map = {r: i for i, r in enumerate(row_idx)}
-
-        # 3. 建立“原始行号 → dense 行号”映射数组（-1 表示不要）
-        row_map = np.full(X.shape[0], -1, dtype=np.int32)
-        row_map[row_idx] = np.arange(len(row_idx), dtype=np.int32)
-
-        # 4. 一次性过滤：只保留用户要的行
-        mask_keep = row_map[X.row] != -1          # bool 数组
-        keep_row = row_map[X.row[mask_keep]]      # 在 dense 中的行号
-        keep_col = X.col[mask_keep]               # 对应列号
-        keep_val = X.data[mask_keep]              # 对应值
-
-        # 5. 向量式写回
-        dense[keep_row, keep_col] = keep_val
-
-        # 6. -1 → seq_depth-1
-        dense[dense == -1] = self.seq_depth - 1
-        return dense
+        return dense.astype(np.int8)
 
     @classmethod
     def loadfromdisk(cls, work_dir: str):
@@ -331,7 +282,7 @@ class GenotypeEncoder:
         obj = cls.__new__(cls)  # 不调用 __init__
         obj.vcf_path    = meta["vcf_path"]
         obj.evo_mat     = meta["evo_mat"]
-        obj.default_gt  = meta["default_gt"]
+        # obj.default_gt  = meta["default_gt"]
         obj.phased      = bool(meta["phased"])
         obj.gts012      = bool(meta["gts012"])
         obj.n_samples   = int(meta["n_samples"])
@@ -349,6 +300,8 @@ class GenotypeEncoder:
 
         # 4. 读稀疏矩阵
         obj.X_gt = sp.load_npz(os.path.join(work_dir, "gt_matrix.npz"))
+        if obj.X_gt.format != 'csc':
+            obj.X_gt = obj.X_gt.tocsc() 
 
         # 5. 读 extra（如果有）
         evo_mat_path = os.path.join(work_dir, "evo_mat.npy")

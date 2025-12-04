@@ -40,66 +40,50 @@ class GenoEmbedding(nn.Module):
         return embedded + pos_emb
 
 class BiMambaBlock(nn.Module):
-    """Bidirectional Mamba block for genomic sequence processing"""
-
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
         super().__init__()
         self.d_model = d_model
 
-        # Forward and backward Mamba blocks
-        self.mamba_forward = Mamba2(
+        # 只初始化一个 Mamba2 模块
+        self.mamba_shared = Mamba2(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand
         )
 
-        self.mamba_backward = Mamba2(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand
-        )
+        # 正向和反向模块共享参数
+        self.mamba_forward = self.mamba_shared
+        self.mamba_backward = self.mamba_shared  # 共享参数
 
-        # Layer normalization
+        # 其余部分保持不变
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-
-        # FFN
         self.ffn = nn.Sequential(
             nn.Linear(d_model * 2, d_model * 4),
             nn.GELU(),
             nn.Linear(d_model * 4, d_model),
             nn.GELU()
         )
-
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
-        # x shape: (batch, seq_len, d_model)
         residual = x
-
-        # Bidirectional processing
         x_norm = self.norm1(x)
 
-        # Forward direction
+        # 正向处理
         forward_out = self.mamba_forward(x_norm)
 
-        # Backward direction (flip sequence)
+        # 反向处理（复用同一个模块）
         x_backward = torch.flip(x_norm, dims=[1])
-        backward_out = self.mamba_backward(x_backward)
+        backward_out = self.mamba_backward(x_backward)  # 实际调用的是 self.mamba_shared
         backward_out = torch.flip(backward_out, dims=[1])
 
-        # Concatenate bidirectional outputs
+        # 其余部分保持不变
         bi_out = torch.cat([forward_out, backward_out], dim=-1)
-
-        # FFN
         ffn_out = self.ffn(bi_out)
         ffn_out = self.dropout(ffn_out)
-
-        # Residual connection
         out = self.norm2(residual + ffn_out)
-
         return out
 
 class ConvBlock(nn.Module):
@@ -346,14 +330,14 @@ class GlobalOut(nn.Module):
         nn.init.kaiming_normal_(self.w2)
 
         # -------------- 2) ulr 中间件（Mamba2） --------------
-        self.ulr_mamba = UltraLongRangeMamba(
-            d_model=d_model,
-            chunk_size=chunk_size,
-            total_sites = total_sites,
-            threshold=0.05,
-            d_state=64, d_conv=4, expand=2,
-            n_layers=2,
-            )
+        # self.ulr_mamba = UltraLongRangeMamba(
+        #     d_model=d_model,
+        #     chunk_size=chunk_size,
+        #     total_sites = total_sites,
+        #     threshold=0.05,
+        #     d_state=64, d_conv=4, expand=2,
+        #     n_layers=1,
+        #     )
 
     # ============ 前向：ulr 是可插拔中间件 ============
     def forward(self, x, mask):
@@ -385,8 +369,8 @@ class GlobalOut(nn.Module):
         #     fused = h_local
         # else:
         # 第二阶段：Mamba2 全局建模并融合
-        fused = self.ulr_mamba(h_local, idx)                 # (B, M, d_model//2)
-
+        # fused = self.ulr_mamba(h_local, idx)                 # (B, M, d_model//2)
+        fused = h_local
         # ---- 3) 统一走 Conv2：d_model//2 -> n_alleles-1 ----
         y_final = F.conv1d(fused.transpose(1, 2), self.w2, self.b2, padding=self.p)
         out[..., idx] = y_final
