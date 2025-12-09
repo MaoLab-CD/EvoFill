@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from cyvcf2 import VCF
 import scipy.sparse as sp
+from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 
@@ -262,7 +263,7 @@ class GenotypeEncoder:
         return dense.astype(np.int8)
 
     @classmethod
-    def loadfromdisk(cls, work_dir: str):
+    def loadfromdisk(cls, work_dir: Path):
         """
         反向构造 GenotypeEncoder，要求 work_dir 里必须有：
             gt_matrix.npz      -> X_gt  (scipy.sparse.csc_matrix)
@@ -413,7 +414,7 @@ class ImputationDataset(Dataset):
         for idx in self.indices:
             row = self.gts_sparse[idx].toarray().ravel()
             total += row.size
-            missing += (row == self.seq_depth - 1).sum()
+            missing += (row == - 1).sum()
         return missing / total if total else 0.
 
     def print_missing_stat(self):

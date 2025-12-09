@@ -45,16 +45,18 @@ class BiMambaBlock(nn.Module):
         self.d_model = d_model
 
         # 只初始化一个 Mamba2 模块
-        self.mamba_shared = Mamba2(
+        self.mamba_forward = Mamba2(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand
         )
-
-        # 正向和反向模块共享参数
-        self.mamba_forward = self.mamba_shared
-        self.mamba_backward = self.mamba_shared  # 共享参数
+        self.mamba_backward = Mamba2(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
+        )
 
         # 其余部分保持不变
         self.norm1 = nn.LayerNorm(d_model)
@@ -74,9 +76,9 @@ class BiMambaBlock(nn.Module):
         # 正向处理
         forward_out = self.mamba_forward(x_norm)
 
-        # 反向处理（复用同一个模块）
+        # 反向处理
         x_backward = torch.flip(x_norm, dims=[1])
-        backward_out = self.mamba_backward(x_backward)  # 实际调用的是 self.mamba_shared
+        backward_out = self.mamba_backward(x_backward)
         backward_out = torch.flip(backward_out, dims=[1])
 
         # 其余部分保持不变
@@ -329,16 +331,6 @@ class GlobalOut(nn.Module):
         nn.init.kaiming_normal_(self.w1)
         nn.init.kaiming_normal_(self.w2)
 
-        # -------------- 2) ulr 中间件（Mamba2） --------------
-        # self.ulr_mamba = UltraLongRangeMamba(
-        #     d_model=d_model,
-        #     chunk_size=chunk_size,
-        #     total_sites = total_sites,
-        #     threshold=0.05,
-        #     d_state=64, d_conv=4, expand=2,
-        #     n_layers=1,
-        #     )
-
     # ============ 前向：ulr 是可插拔中间件 ============
     def forward(self, x, mask):
         """
@@ -363,16 +355,9 @@ class GlobalOut(nn.Module):
             y1 = checkpoint(self._band_conv1, x_i, self.w1, self.b1, use_reentrant=False)
             h_local.append(y1)
         h_local = torch.cat(h_local, dim=2).transpose(1, 2)  # (B, M, d_model//2)
-        # # ---- 2) ulr 中间件（可选） ----
-        # if self.skip_ulr:
-        #     # 第一阶段：不做任何全局事，h_local 保持原样
-        #     fused = h_local
-        # else:
-        # 第二阶段：Mamba2 全局建模并融合
-        # fused = self.ulr_mamba(h_local, idx)                 # (B, M, d_model//2)
-        fused = h_local
+
         # ---- 3) 统一走 Conv2：d_model//2 -> n_alleles-1 ----
-        y_final = F.conv1d(fused.transpose(1, 2), self.w2, self.b2, padding=self.p)
+        y_final = F.conv1d(h_local.transpose(1, 2), self.w2, self.b2, padding=self.p)
         out[..., idx] = y_final
 
         return out.transpose(1, 2)

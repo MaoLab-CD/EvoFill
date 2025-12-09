@@ -9,6 +9,7 @@ DeepSpeed ZeRO-3 多卡并行
 import math
 import torch
 import json
+import datetime
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -24,12 +25,8 @@ from src.data import GenotypeEncoder, GenomicDataset
 from src.loss import ImputationLoss
 
 # ================= 1. 超参数 =================
-# MODEL_NAME         = "chr22"
-# WORK_DIR           = Path('/data/home/7240203/EvoFill_data/1kGP_chr22')
-# MODEL_NAME         = "chr6"
-# WORK_DIR           = Path('/data/home/7240325/EvoFill_data/1kGP_chr6')
-MODEL_NAME         = "hg38_chr22"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/1kGP_chr22')
+MODEL_NAME         = "hg38_HLA"
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251205_HLA/')
 PRETRAIN_DIR       = WORK_DIR / "train"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 
@@ -45,7 +42,7 @@ D_STATE            = 64
 HEADDIM            = 64
 
 MAX_EPOCHS         = 1000
-EARLYSTOP_PATIENCE = 11
+EARLYSTOP_PATIENCE = 21
 SCHEDULER_FACTOR   = 0.5
 SCHEDULER_PATIENCE = 5
 SCHEDULER_MIN_LR   = 1e-8
@@ -207,12 +204,10 @@ for epoch in range(MAX_EPOCHS):
     if avg_test_loss < best_loss:
         best_loss = avg_test_loss
         patience_counter = 0
-        accelerator.wait_for_everyone()
-        unwrapped = accelerator.unwrap_model(model)
-        ckpt = {"model_state": unwrapped.state_dict(),
-                "best_test_loss": best_loss}
-        if accelerator.is_main_process:
-            accelerator.save(ckpt, f"{MODEL_SAVE_DIR}/{MODEL_NAME}_stage1.pth")
+        ts = datetime.datetime.now().strftime("%m%d-%H%M%S")
+        ckpt_path = MODEL_SAVE_DIR / f"checkpoint-stage1-{ts}"
+        accelerator.save_state(output_dir=ckpt_path)
+        pprint(f"  --> {ts} checkpoint-stage1 updated.")
     else:
         patience_counter += 1
         if patience_counter >= EARLYSTOP_PATIENCE:

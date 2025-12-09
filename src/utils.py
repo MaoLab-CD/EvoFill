@@ -61,31 +61,24 @@ def precompute_maf(gts_np, mask_int=-1):
         maf: (L,) float32
         bin_cnt: list[int] 长度 6，对应 6 个 bin 的位点数量
     """
-    L = gts_np.shape[1]
-    maf = np.zeros(L, dtype=np.float32)
-    bin_cnt = [0] * 6
+    # ===== 5. 计算每个位点的 MAF 和 bin 里 SNP 数 =====
+    # gts_np: 0,1,2,-1  -> alt 等位基因个数就是 0/1/2
+    valid = (gts_np >= 0)
+    n_valid = valid.sum(axis=0)              # (L,)
+    alt_total = np.where(valid, gts_np, 0).sum(axis=0).astype(float)  # (L,)
+    denom = 2.0 * n_valid
+    with np.errstate(divide="ignore", invalid="ignore"):
+        freq = np.where(denom > 0, alt_total / denom, 0.0)
+    # maf: 次要等位基因频率
+    maf_vec = np.minimum(freq, 1.0 - freq)   # (L,)
 
-    for l in range(L):
-        alleles = gts_np[:, l]
-        alleles = alleles[alleles != mask_int]   # 去掉缺失
-        if alleles.size == 0:
-            maf[l] = 0.0
-            continue
+    # 每个 bin 的 SNP 数
+    chunk_bin_cnt = []
+    for lo, hi in MAF_BINS:
+        cnt = int(((maf_vec >= lo) & (maf_vec < hi)).sum())
+        chunk_bin_cnt.append(cnt)
 
-        uniq, cnt = np.unique(alleles, return_counts=True)
-        total = cnt.sum()
-        freq = cnt / total
-        freq[::-1].sort()
-        maf_val = freq[1] if len(freq) > 1 else 0.0
-        maf[l] = maf_val
-
-        # 统计 bin
-        for i, (lo, hi) in enumerate(MAF_BINS):
-            if lo <= maf_val < hi:
-                bin_cnt[i] += 1
-                break
-
-    return maf, bin_cnt
+    return maf_vec, chunk_bin_cnt
 
 def build_geno3_map_from_hapmap(hap_map: dict) -> np.ndarray:
     # 定义一个映射：从基因型到分类
