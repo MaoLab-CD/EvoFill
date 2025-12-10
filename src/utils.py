@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 import random
 import pandas as pd
+from scipy import stats
 
 MAF_BINS = [(0.00, 0.05), (0.05, 0.10), (0.10, 0.20),
             (0.20, 0.30), (0.30, 0.40), (0.40, 0.50)]
@@ -286,4 +287,240 @@ def print_maf_stat_df(
             df[col_name] = [f"{v:.3f}" for v in grp[m]]
 
     # 3. 打印（不带行索引）
+    print(df.to_string(index=False))
+
+def ci95_t(data, confidence_level=0.95):
+    data = np.asarray(data, dtype=float)
+    data = data[np.isfinite(data)]
+
+    if data.size == 0:
+        return np.nan, np.nan
+    if data.size == 1:
+        m = float(data[0])
+        return m, m
+
+    m = float(np.mean(data))
+    se = stats.sem(data)
+
+    # 当标准误为 0（几乎全一样）直接返回 [mean, mean]
+    if not np.isfinite(se) or se == 0.0:
+        return m, m
+
+    lo, hi = stats.t.interval(
+        confidence_level,
+        data.size - 1,
+        loc=m,
+        scale=se
+    )
+    return float(lo), float(hi)
+
+# ---------- 5. 唯一对外接口 ----------
+def metrics_by_maf_with95ci(prob: torch.Tensor,
+                   y_true: torch.Tensor,
+                   hap_map : Dict,
+                   maf_vec: np.ndarray,
+                   bins: List[Tuple[float, float]] = MAF_BINS,
+                   mask: Optional[torch.Tensor] = None
+                   ) -> Dict[str, List[float]]:
+    """
+    返回 dict:
+        {
+          'Acc'   : [...],          # 仍然是严格的 n_cor / n_tot
+          'Acc_n' : [...],          # 严格样本量
+          'Acc_ci_low'  : [...],
+          'Acc_ci_high' : [...],
+
+          'INFO'  : [...],
+          'INFO_ci_low'  : [...],
+          'INFO_ci_high' : [...],
+
+          'MaCH'  : [...],
+          'MaCH_ci_low'  : [...],
+          'MaCH_ci_high' : [...],
+
+          'IQS'   : [...],
+          'IQS_ci_low'   : [...],
+          'IQS_ci_high'  : [...]
+        }
+    说明：
+    - 95% CI 使用 SciPy: stats.t.interval + stats.sem
+    - CI 以“位点为样本单位”，即对每个 bin 内的 per-site 指标分布取 t 区间
+    """
+    with torch.no_grad():
+        if isinstance(prob, torch.Tensor):
+            prob = prob.cpu().numpy()
+        if isinstance(y_true, torch.Tensor):
+            y_true = y_true.cpu().numpy()
+
+        if mask is None:
+            mask = np.ones(prob.shape[:2], dtype=bool)   # (N, L)
+        else:
+            if isinstance(mask, torch.Tensor):
+                mask = mask.cpu().numpy()
+            mask = mask.astype(bool)
+
+        # 三分类
+        prob3, y3 = aggregate_three_classes(prob, y_true, hap_map)
+
+        # ---------- Acc: 严格均值 + per-site 分布用于 CI ----------
+        preds = prob3.argmax(-1)   # (N, L)
+        gts   = y3.argmax(-1)      # (N, L)
+        correct = (preds == gts) & mask
+
+        # 严格 Acc（沿用你现有逻辑）
+        acc_bins: List[float] = []
+        acc_n_tot: List[int] = []
+
+        # per-site accuracy（用于 t CI）
+        n_valid_site = mask.sum(axis=0)          # (L,)
+        n_cor_site   = correct.sum(axis=0)       # (L,)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            acc_site = np.where(n_valid_site > 0,
+                                n_cor_site / n_valid_site,
+                                np.nan).astype(float)
+
+        # ---------- 其余 3 个 per-site 指标 ----------
+        info_all, mach_all, iqs_all = _compute_site_metrics(prob3, y3, mask)
+
+        # bins 的均值
+        info_bins, mach_bins, iqs_bins = [], [], []
+
+        # bins 的 CI
+        acc_ci_low, acc_ci_high   = [], []
+        info_ci_low, info_ci_high = [], []
+        mach_ci_low, mach_ci_high = [], []
+        iqs_ci_low, iqs_ci_high   = [], []
+
+        for lo, hi in bins:
+            idx = (maf_vec >= lo) & (maf_vec < hi)   # (L,)
+
+            # ---- Acc mean (严格) ----
+            mbin = mask & idx                         # (N, L) broadcast
+            n_tot = int(np.count_nonzero(mbin))
+            n_cor = int(np.count_nonzero(correct & mbin))
+            acc_n_tot.append(n_tot)
+            acc_bins.append(n_cor / n_tot if n_tot > 0 else 0.0)
+
+            # ---- Acc CI (t over sites) ----
+            acc_data = acc_site[idx]
+            lo_a, hi_a = ci95_t(acc_data, 0.95)
+            acc_ci_low.append(0.0 if np.isnan(lo_a) else float(lo_a))
+            acc_ci_high.append(0.0 if np.isnan(hi_a) else float(hi_a))
+
+            # ---- INFO mean + CI ----
+            info_data = info_all[idx]
+            if idx.sum() == 0:
+                info_bins.append(0.0)
+                info_ci_low.append(0.0)
+                info_ci_high.append(0.0)
+            else:
+                info_bins.append(float(np.nanmean(info_data)))
+                lo_i, hi_i = ci95_t(info_data, 0.95)
+                info_ci_low.append(0.0 if np.isnan(lo_i) else float(lo_i))
+                info_ci_high.append(0.0 if np.isnan(hi_i) else float(hi_i))
+
+            # ---- MaCH mean + CI ----
+            mach_data = mach_all[idx]
+            if idx.sum() == 0:
+                mach_bins.append(0.0)
+                mach_ci_low.append(0.0)
+                mach_ci_high.append(0.0)
+            else:
+                mach_bins.append(float(np.nanmean(mach_data)))
+                lo_m, hi_m = ci95_t(mach_data, 0.95)
+                mach_ci_low.append(0.0 if np.isnan(lo_m) else float(lo_m))
+                mach_ci_high.append(0.0 if np.isnan(hi_m) else float(hi_m))
+
+            # ---- IQS mean + CI ----
+            iqs_data = iqs_all[idx]
+            if idx.sum() == 0:
+                iqs_bins.append(0.0)
+                iqs_ci_low.append(0.0)
+                iqs_ci_high.append(0.0)
+            else:
+                iqs_bins.append(float(np.nanmean(iqs_data)))
+                lo_q, hi_q = ci95_t(iqs_data, 0.95)
+                iqs_ci_low.append(0.0 if np.isnan(lo_q) else float(lo_q))
+                iqs_ci_high.append(0.0 if np.isnan(hi_q) else float(hi_q))
+
+    return {
+        'Acc': acc_bins,
+        'Acc_n': acc_n_tot,
+
+        'Acc_ci_low': acc_ci_low,
+        'Acc_ci_high': acc_ci_high,
+
+        'INFO': info_bins,
+        'INFO_ci_low': info_ci_low,
+        'INFO_ci_high': info_ci_high,
+
+        'MaCH': mach_bins,
+        'MaCH_ci_low': mach_ci_low,
+        'MaCH_ci_high': mach_ci_high,
+
+        'IQS': iqs_bins,
+        'IQS_ci_low': iqs_ci_low,
+        'IQS_ci_high': iqs_ci_high,
+    }
+
+
+# ---------- 6. 打印 ----------
+def print_maf_stat_df_with95ci(
+    chunk_bin_cnt: List[int],
+    bins_metrics: Dict[str, Dict[str, List[float]]],
+    maf_bins: List[str] = None,
+) -> None:
+    """
+    打印 MAF 分箱统计表。
+    如果 bins_metrics 中包含 {metric}_ci_low/{metric}_ci_high，
+    则自动生成 {prefix}_{metric}_CI95 列。
+    """
+    if maf_bins is None:
+        maf_bins = ['(0.00, 0.05)', '(0.05, 0.10)', '(0.10, 0.20)',
+                    '(0.20, 0.30)', '(0.30, 0.40)', '(0.40, 0.50)']
+
+    if len(chunk_bin_cnt) != len(maf_bins):
+        raise ValueError("len(chunk_bin_cnt) != len(maf_bins)")
+
+    df = pd.DataFrame({
+        'MAF_bin': maf_bins,
+        'Counts':  [f"{c}" for c in chunk_bin_cnt]
+    })
+
+    first_group = next(iter(bins_metrics.values()))
+
+    # 只把“基础均值指标”找出来，排除 _n / _ci_low / _ci_high
+    metrics_names = sorted([
+        name for name in first_group.keys()
+        if not name.endswith('_n')
+        and not name.endswith('_ci_low')
+        and not name.endswith('_ci_high')
+    ])
+
+    # 1) 均值列
+    for prefix in sorted(bins_metrics.keys()):
+        grp = bins_metrics[prefix]
+        for m in metrics_names:
+            if m not in grp:
+                continue
+            df[f"{prefix}_{m}"] = [f"{v:.3f}" for v in grp[m]]
+
+    # 2) CI 列（所有指标）
+    for prefix in sorted(bins_metrics.keys()):
+        grp = bins_metrics[prefix]
+        for m in metrics_names:
+            lo_list = grp.get(f"{m}_ci_low", None)
+            hi_list = grp.get(f"{m}_ci_high", None)
+            if lo_list is None or hi_list is None:
+                continue
+
+            ci_str = []
+            for lo, hi in zip(lo_list, hi_list):
+                if lo is None or hi is None:
+                    ci_str.append("NA")
+                else:
+                    ci_str.append(f"[{float(lo):.3f}, {float(hi):.3f}]")
+
+            df[f"{prefix}_{m}_CI95"] = ci_str
+
     print(df.to_string(index=False))

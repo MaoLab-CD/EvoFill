@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from typing import List, Optional, Union
 
+from timm.layers import DropPath
 from mamba_ssm import Mamba2
 from mamba_ssm.modules.mamba2_simple import Mamba2Simple as Mamba2Block # 原Mamba2Block
 
@@ -40,7 +41,7 @@ class GenoEmbedding(nn.Module):
         return embedded + pos_emb
 
 class BiMambaBlock(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, drop_path=0.,init_value=1e-4):
         super().__init__()
         self.d_model = d_model
 
@@ -57,7 +58,10 @@ class BiMambaBlock(nn.Module):
             d_conv=d_conv,
             expand=expand
         )
+        self.mamba_backward.conv1d.weight = self.mamba_forward.conv1d.weight
+        self.mamba_backward.conv1d.bias   = self.mamba_forward.conv1d.bias
 
+        self.gamma = nn.Parameter(init_value * torch.ones(d_model))
         # 其余部分保持不变
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -68,24 +72,23 @@ class BiMambaBlock(nn.Module):
             nn.GELU()
         )
         self.dropout = nn.Dropout(0.1)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
         residual = x
         x_norm = self.norm1(x)
 
-        # 正向处理
-        forward_out = self.mamba_forward(x_norm)
+        # 把计算量大的部分包起来
+        def _block(x_):
+            f = self.mamba_forward(x_)
+            b = self.mamba_backward(torch.flip(x_, [1]))
+            b = torch.flip(b, [1])
+            return torch.cat([f, b], -1)
 
-        # 反向处理
-        x_backward = torch.flip(x_norm, dims=[1])
-        backward_out = self.mamba_backward(x_backward)
-        backward_out = torch.flip(backward_out, dims=[1])
-
-        # 其余部分保持不变
-        bi_out = torch.cat([forward_out, backward_out], dim=-1)
+        bi_out = checkpoint(_block, x_norm, use_reentrant=False)
         ffn_out = self.ffn(bi_out)
         ffn_out = self.dropout(ffn_out)
-        out = self.norm2(residual + ffn_out)
+        out = self.norm2(residual + self.drop_path(self.gamma * ffn_out))
         return out
 
 class ConvBlock(nn.Module):
@@ -105,8 +108,8 @@ class ConvBlock(nn.Module):
         self.conv_final = nn.Conv1d(d_model, d_model, kernel_size=3, padding=1)
         self.conv_reduce = nn.Conv1d(d_model, d_model, kernel_size=1)
 
-        self.bn1 = nn.BatchNorm1d(d_model)
-        self.bn2 = nn.BatchNorm1d(d_model)
+        self.bn1 = nn.GroupNorm(8, d_model)
+        self.bn2 = nn.GroupNorm(8, d_model)
 
         self.gelu = nn.GELU()
 
@@ -379,6 +382,7 @@ class EvoFill(nn.Module):
         d_state: int = 64, 
         headdim: int = 128,
         dropout_rate: float = 0.1,
+        drop_path_rate: float = 0.1
     ):
         super().__init__()
         self.d_model = d_model
@@ -402,6 +406,13 @@ class EvoFill(nn.Module):
         self.chunk_modules = nn.ModuleList(
             ChunkModule(d_model,d_state, headdim, dropout_rate) for s, e in zip(starts, ends)
         )
+
+        depth = 0
+        for cid in range(self.n_chunks):
+            rate = drop_path_rate * (depth / (self.n_chunks * 2))  # 线性增
+            self.chunk_modules[cid].bimamba_block.drop_path = DropPath(rate)
+            self.chunk_modules[cid].stack_mamba.drop_path   = DropPath(rate)
+            depth += 2
 
         # 3. 全局输出层
         self.global_out = GlobalOut(d_model, n_alleles, total_sites, chunk_size)
