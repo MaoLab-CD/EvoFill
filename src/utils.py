@@ -43,7 +43,7 @@ def set_seed(seed=42):
 
 def setup_workdir(save_dir, ) -> None:
     """Create necessary directories"""
-    sub_dir = ["models", "train", "augment", "finetune", "impute_in", "impute_out"]
+    sub_dir = ["models", "train", "augment", "impute_in", "impute_out"]
     if not os.path.exists(save_dir):
             os.makedirs(save_dir)
     for dd in sub_dir:

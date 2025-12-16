@@ -9,50 +9,55 @@ DeepSpeed ZeRO-3 多卡并行
 """
 import math
 import torch
+import json
 import datetime
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split
 from functools import partial
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from accelerate import Accelerator
 from accelerate.utils import set_seed as accelerate_set_seed
 
-from src.data import GenotypeEncoder, GenomicDataset
+from src.data import GenotypeEncoder, GenomicDataset, GenomicDataset_1240k
 from src.model import EvoFill
-from src.loss import ImputationLoss
+from src.loss import ImputationLoss_Missing
 
 # ================= 1. 超参数 =================
-MODEL_NAME         = "hg38_HLA"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251205_HLA/')
+MODEL_NAME         = "hg38_chr22"
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251211_chr22/')
 PRETRAIN_DIR       = WORK_DIR / "train"
 AUGMENT_DIR        = WORK_DIR / "augment"
-FINETUNE_DIR        = WORK_DIR / "finetune"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
+ADNA_SITE_MAP      = AUGMENT_DIR / "aDNA-1kGP_sitesmap.npy"
+PRETRAIN_BIN       = MODEL_SAVE_DIR / "pytorch_model_stage1.bin"
 
-# TEST_RATIO         = 0.30                    ### Stage-3 差异：30% 预训练样本做测试
-BATCH_SIZE         = 16
+TEST_N_SAMPLES     = 128
+BATCH_SIZE         = 4
 MIN_MASK_RATE      = 0.05
-MAX_MASK_RATE      = 0.95
+MAX_MASK_RATE      = 0.5
 
 CHUNK_SIZE         = 65536
 OVERLAP            = 1024
-D_MODEL            = 64
-D_STATE            = 64
-HEADDIM            = 64
+D_MODEL            = 128
+D_STATE            = 128
+HEADDIM            = 128
+N_BIMAMBA          = 4
+N_STACK_MAMBA      = 4
 
-MAX_EPOCHS         = 1000
-EARLYSTOP_PATIENCE = 21
-SCHEDULER_FACTOR   = 0.5
-SCHEDULER_PATIENCE = 5
+MAX_EPOCHS         = 200
+EARLYSTOP_PATIENCE = 13
+SCHEDULER_FACTOR   = 0.1
+SCHEDULER_PATIENCE = 3
 SCHEDULER_MIN_LR   = 1e-9
 SEED               = 3047
 
-# 优化器
-LR           = 1e-4
-BETAS        = (0.9, 0.999)
-WD           = 1e-6
+# 优化器专属
+LR          = 1e-5
+BETAS       = (0.9, 0.999)
+WD           = 1e-5
 # ============================================================================
 
 def pprint(*args):
@@ -67,27 +72,27 @@ world_size = accelerator.num_processes
 
 SCHEDULER_PATIENCE = SCHEDULER_PATIENCE * world_size
 EARLYSTOP_PATIENCE = EARLYSTOP_PATIENCE * world_size 
+
 # -------------- 1. 数据 --------------
-
-# ### Stage-2 差异：训练集=augment，测试集=URP
 gt_enc_train = GenotypeEncoder.loadfromdisk(AUGMENT_DIR)
-gt_enc_test  = GenotypeEncoder.loadfromdisk(FINETUNE_DIR)
+gt_enc_test  = GenotypeEncoder.loadfromdisk(PRETRAIN_DIR)
 
-assert gt_enc_train.seq_depth  == gt_enc_test.seq_depth
-assert gt_enc_train.n_variants == gt_enc_test.n_variants
+_, test_idx = train_test_split(
+    range(gt_enc_test.n_samples),
+    test_size=TEST_N_SAMPLES,
+    random_state=SEED,
+    shuffle=True,
+)
 
-TOTAL_SITES = gt_enc_train.n_variants
-ALLELES     = gt_enc_train.seq_depth
-pprint(f"Train: {gt_enc_train.n_samples:,} samples")
-pprint(f"Test : {gt_enc_test.n_samples:,} samples")
-
-train_ds = GenomicDataset(
-    gt_enc_train, evo_mat=gt_enc_train.evo_mat, mask=True,
-    masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE), indices=None
+train_ds = GenomicDataset_1240k(
+    gt_enc_train, evo_mat=gt_enc_train.evo_mat, 
+    site_map =  np.load(ADNA_SITE_MAP),
+    big_dim=gt_enc_test.n_variants,
+    mask=True, masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE),
+    indices=None
 )
 test_ds = GenomicDataset(
-    gt_enc_test, evo_mat=gt_enc_test.evo_mat, mask=True,
-    masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE), indices=None
+    gt_enc_test, evo_mat=gt_enc_test.evo_mat, mask=False, indices=test_idx
 )
 
 def collate_fn(batch, dataset):
@@ -111,36 +116,59 @@ test_loader = torch.utils.data.DataLoader(
     num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=test_ds)
 )
 
+pprint(f"Augment: {gt_enc_train.n_samples:,} samples")
+pprint(f"Test   : {len(test_idx):,} samples")
+
 # -------------- 2. 模型 --------------
+meta = json.load(open(MODEL_SAVE_DIR / "model_meta.json"))
+model_raw = EvoFill(
+                    n_alleles=int(meta["alleles"]),
+                    total_sites=int(meta["total_sites"]),
+                    chunk_size=int(meta["chunk_size"]),
+                    chunk_overlap=int(meta["overlap"]),
+                    d_model=int(meta["d_model"]),
+                    d_state=int(meta["d_state"]),
+                    headdim=int(meta["headdim"]),
+                    bimamba_layers=int(meta["bimamba_layers"]),
+                    stack_mamba_layers=int(meta["stack_mamba_layers"])
+                ).to(device)
 
-model_raw = EvoFill(ALLELES, TOTAL_SITES, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM)
-
-state_dict = torch.load(f"{MODEL_SAVE_DIR}/pytorch_model_stage1.bin", map_location="cpu")
+state_dict = torch.load(PRETRAIN_BIN, map_location="cpu")
 model_raw.load_state_dict(state_dict)
 
-
 # -------------- 3. 只解冻 embedding + global_out --------------
-# trainable_para= []
-# # 3.1 GlobalOut 全部
-# for name, p in model_raw.global_out.named_parameters():
-#         trainable_para.append(p)
-# # 3.2 Chunk-Embedding
-# for emb in model_raw.chunk_embeds:
-#     for p in emb.parameters():
-#         trainable_para.append(p)
+trainable_para= []
+# 3.1 GlobalOut 全部
+for name, p in model_raw.global_out.named_parameters():
+        trainable_para.append(p)
+# 3.2 Chunk-Embedding
+for emb in model_raw.chunk_embeds:
+    for p in emb.parameters():
+        trainable_para.append(p)
 
-# # 先全部冻住
-# for p in model_raw.parameters():
-#     p.requires_grad = False
-# # 再放开需要的
-# for p in trainable_para:
-#     p.requires_grad = True
+# 先全部冻住
+for p in model_raw.parameters():
+    p.requires_grad = False
+# 再放开需要的
+for p in trainable_para:
+    p.requires_grad = True
 
-# print("Trainable params:", len(trainable_para))
+
+trainable = 0
+frozen = 0
+for p in model_raw.parameters():
+    if p.requires_grad:
+        trainable += p.numel()
+    else:
+        frozen += p.numel()
+pprint(f"Trainable : {trainable:,}")
+pprint(f"Frozen    : {frozen:,}")
+pprint(f"Total     : {trainable + frozen:,}")
+
 # -------------- 4. 优化器 --------------
-# optimizer  = AdamW(trainable_para, lr=LR, betas=BETAS, weight_decay=WD)
+optimizer  = AdamW(trainable_para, lr=LR, betas=BETAS, weight_decay=WD)
 
-optimizer = AdamW(model_raw.parameters(), lr=LR, betas=BETAS, weight_decay=WD)
+# optimizer = AdamW(model_raw.parameters(), lr=LR, betas=BETAS, weight_decay=WD)
 
 scheduler  = ReduceLROnPlateau(optimizer, mode='min', factor=SCHEDULER_FACTOR,
                                  patience=SCHEDULER_PATIENCE, min_lr=SCHEDULER_MIN_LR)
@@ -152,74 +180,96 @@ model, *opt_sch = accelerator.prepare(
 )
 optimizer, scheduler = opt_sch[:2]
 
-# -------------- 6. Loss --------------
+def find_latest_ckpt(save_dir: Path):
+    if not save_dir.exists():
+        return None
+    dirs = [d for d in save_dir.iterdir()
+            if d.is_dir() and d.name.startswith("checkpoint-stage2-")]
+    if not dirs:
+        return None
+    # 按时间戳排序：先拆出 “1211-193253” 这种子串
+    dirs.sort(key=lambda x: datetime.datetime.strptime(
+              x.name.split("-", 2)[2],   # 取第三段以后
+              "%m%d-%H%M%S"))
+    return dirs[-1]
 
-criterion = ImputationLoss(use_r2=True, use_evo=True, r2_weight=1, evo_weight=4, evo_lambda=10)
+latest_ckpt = find_latest_ckpt(MODEL_SAVE_DIR)
+
+if latest_ckpt is not None:
+    pprint(f"Find previous checkpoint: {latest_ckpt.name}, loading state...")
+    accelerator.load_state(latest_ckpt)
+
+    # 把 best_loss / patience_counter / start_epoch 读回来
+    meta_json = latest_ckpt / "training_meta.json"
+    if meta_json.exists():
+        with open(meta_json, "r") as f:
+            meta = json.load(f)
+        best_loss        = meta.get("best_loss", math.inf)
+        patience_counter = meta.get("patience_counter", 0)
+        start_epoch      = meta.get("epoch", 0) + 1   # 下一 epoch
+    pprint(f"Successfully resume from epoch {start_epoch}, best_loss={best_loss:.4f}, patience={patience_counter}")
+else:
+    start_epoch = 0
+    best_loss = math.inf
+    patience_counter = 0
+    pprint("No checkpoint found, train from scratch.")
+
+# -------------- 6. Loss --------------
+criterion = ImputationLoss_Missing(use_r2=True, use_evo=True, r2_weight=1, evo_weight=4, evo_lambda=10)
 
 # -------------- 7. 训练 --------------
 best_loss = math.inf
 patience_counter = 0
 predres_with_bestloss = None
 
-for epoch in range(MAX_EPOCHS):
+for epoch in range(start_epoch, MAX_EPOCHS):
     # ---- train ----
     model.train()
     tot_loss = 0.0
-    train_prob, train_gts, train_mask = [], [], []
     train_pbar = tqdm(train_loader, disable=not accelerator.is_main_process,
-                          desc=f"[aDNA] Epoch {epoch+1} / {MAX_EPOCHS}")
+                      desc=f'Epoch {epoch + 1}/{MAX_EPOCHS}')
     for _, (x, y, evo) in enumerate(train_pbar):
         x, y = x.to(device), y.to(device)
         evo = evo.to(device) if evo.numel() else None
 
-        optimizer.zero_grad()
+        # 一个 batch 内按 chunk 顺序 forward
+        batch_loss = 0.0
+        for cid in range(model.module.n_chunks):
+            optimizer.zero_grad()
+            logits, prob, mask_idx = model(x, cid)
+            loss, logs = criterion(logits[:, mask_idx], prob[:, mask_idx],
+                                   y[:, mask_idx], evo)
+            accelerator.backward(loss)
+            optimizer.step()
+            batch_loss += loss.item()
 
-        # 不分 chunk → cid=None
-        logits, prob, mask_idx = model(x, None)
-        loss, logs = criterion(logits[:, mask_idx], prob[:, mask_idx],
-                               y[:, mask_idx], evo)
-        accelerator.backward(loss)
-        optimizer.step()
-        tot_loss += loss.item()
-
-        train_pbar.set_postfix({'loss': loss.item(), 'ce':logs['ce'], 'r2':logs['r2'], 'evo':logs['evo']})
-
-        # 收集指标
-        miss_mask = x[:, mask_idx][..., -1].bool()
-        train_prob.append(prob[:, mask_idx].detach())
-        train_gts.append(y[:, mask_idx].detach())
-        train_mask.append(miss_mask)
+        avg_batch_loss = batch_loss / model.module.n_chunks
+        tot_loss += avg_batch_loss
+        train_pbar.set_postfix({'loss': avg_batch_loss,
+                                'ce': logs['ce'], 'r2': logs['r2'], 'evo': logs['evo']})
 
     avg_train_loss = tot_loss / len(train_loader)
-    train_prob = torch.cat(train_prob, dim=0)
-    train_gts  = torch.cat(train_gts,  dim=0)
-    train_mask = torch.cat(train_mask, dim=0)
 
     # ---- eval ----
     model.eval()
     tot_loss = 0.0
-    test_prob, test_gts = [], []
     with torch.no_grad():
-        for x, y, evo in tqdm(test_loader, disable=not accelerator.is_main_process,
-                          desc=f"[URP]  Epoch {epoch+1} / {MAX_EPOCHS}"):
+        for x, y, evo in test_loader:
             x, y = x.to(device), y.to(device)
             evo = evo.to(device) if evo.numel() else None
-            logits, prob, mask_idx = model(x, None)
-            loss, _ = criterion(logits[:, mask_idx], prob[:, mask_idx],
-                                y[:, mask_idx], evo)
-            tot_loss += loss.item()
-            test_prob.append(prob[:, mask_idx].detach())
-            test_gts.append(y[:, mask_idx].detach())
-
+            batch_loss = 0.0
+            for cid in range(model.module.n_chunks):
+                logits, prob, mask_idx = model(x, cid)
+                loss, _ = criterion(logits[:, mask_idx], prob[:, mask_idx],
+                                    y[:, mask_idx], evo)
+                batch_loss += loss.item()
+            tot_loss += batch_loss / model.module.n_chunks
     avg_test_loss = tot_loss / len(test_loader)
-    test_prob = torch.cat(test_prob, dim=0)
-    test_gts  = torch.cat(test_gts,  dim=0)
 
-    # scheduler
+    # scheduler / early-stop 保持不变
     scheduler.step(avg_test_loss)
-
-    pprint(f"Epoch {epoch+1} / {MAX_EPOCHS}  aDNA={avg_train_loss:.3f}  urp={avg_test_loss:.3f}  "
-           f"lr={optimizer.param_groups[0]['lr']:.2e}  ")
+    pprint(f"Epoch {epoch + 1}/{MAX_EPOCHS}: train={avg_train_loss:.2f} "
+           f"test={avg_test_loss:.2f} lr={optimizer.param_groups[0]['lr']:.2e} pat={patience_counter}")
 
     # ---- early stop ----
     if avg_test_loss < best_loss:
@@ -228,6 +278,11 @@ for epoch in range(MAX_EPOCHS):
         ts = datetime.datetime.now().strftime("%m%d-%H%M%S")
         ckpt_path = MODEL_SAVE_DIR / f"checkpoint-stage2-{ts}"
         accelerator.save_state(output_dir=ckpt_path)
+        if accelerator.is_main_process:
+            with open(ckpt_path / "training_meta.json", "w") as f:
+                json.dump({"best_loss": best_loss,
+                            "patience_counter": patience_counter,
+                            "epoch": epoch}, f, indent=4)
         pprint(f"  --> {ts} checkpoint-stage2 updated.")
     else:
         patience_counter += 1

@@ -23,7 +23,7 @@ class GenotypeEncoder:
         self.save_dir = save_dir
         # 其余占位
         self.hap_map: Dict[str, int] = {}
-        # self.default_gt = None
+        self.default_gt = 0
         self.seq_depth: Optional[int] = None
         self.n_samples = 0
         self.n_variants = 0
@@ -33,7 +33,7 @@ class GenotypeEncoder:
         self.evo_mat: Optional[np.ndarray] = None
 
     # ========= 2. 首次编码：建立标准 =========
-    def encode_new(self, vcf_path: str, evo_mat: Optional[str] = None,):
+    def encode_new(self, vcf_path: str, evo_mat: Optional[str] = None):
         """第一次编码，允许新建 hap_map 与 seq_depth"""
         self.vcf_path = vcf_path
         # 清空头一次可能遗留的参照
@@ -211,7 +211,7 @@ class GenotypeEncoder:
             "evo_mat": str(self.evo_mat_path),
             "phased": str(self.phased),
             "gts012": str(self.gts012),
-            # "default_gt": str(self.default_gt),
+            "default_gt": str(self.default_gt),
             "n_samples": str(self.n_samples),
             "n_variants": str(self.n_variants),
             "seq_depth": str(self.seq_depth),
@@ -246,7 +246,7 @@ class GenotypeEncoder:
         返回值
         ------
         dense : ndarray, dtype=int8
-            缺失值 = seq_depth-1，参考型 = 0，alt = 原值
+            缺失值 = -1，参考型 = 0，alt = 原值
         """
         # 1. 统一成“行索引数组”
         if idx is None:
@@ -258,9 +258,10 @@ class GenotypeEncoder:
 
         # 2. 拿子矩阵
         sub = self.X_gt[row_idx]          # scipy 支持 fancy indexing
-        dense = sub.toarray()             # 形状 (len(row_idx), n_variants)
 
-        return dense.astype(np.int8)
+        dense = sub.toarray().astype(np.int8)           # 形状 (len(row_idx), n_variants)
+
+        return dense
 
     @classmethod
     def loadfromdisk(cls, work_dir: Path):
@@ -283,7 +284,6 @@ class GenotypeEncoder:
         obj = cls.__new__(cls)  # 不调用 __init__
         obj.vcf_path    = meta["vcf_path"]
         obj.evo_mat     = meta["evo_mat"]
-        # obj.default_gt  = meta["default_gt"]
         obj.phased      = bool(meta["phased"])
         obj.gts012      = bool(meta["gts012"])
         obj.n_samples   = int(meta["n_samples"])
@@ -349,20 +349,30 @@ class GenomicDataset(Dataset):
 
         return x_onehot, y_onehot, real_idx
 
-class GenomicDataset_Missing(Dataset):
-    """Dataset class for genomic data with masking for training"""
-    def __init__(self, gt_encoder,evo_mat=None,
-                 mask=True, masking_rates=(0.5, 0.99), indices=None):
-        """
-        x_gts_sparse: scipy.sparse.csr_matrix or similar
-        evo_mat: numpy array or None
-        indices: 可选，指定要使用的样本索引（如 train/valid 索引）
-        """
+class GenomicDataset_1240k(Dataset):
+    """
+    读取 1240k 古 DNA 矩阵，getitem 时通过 site_map 映射到参考面板。
+    site_map: length = 1240k 位点数，值 ∈ [-1, big_variants)，-1 表示参考面板没有该位点。
+    ref_dim: 参考面板的位点总数（即 evo_mat.shape[1] 如果 evo_mat 不是 None）
+    """
+    def __init__(self, gt_encoder, evo_mat=None, site_map=None,
+                 mask=True, masking_rates=(0.5, 0.99), indices=None,
+                 big_dim=None):
         self.gt_enc = gt_encoder
         self.evo_mat = evo_mat
         self.seq_depth = gt_encoder.seq_depth
         self.mask = mask
         self.masking_rates = masking_rates
+
+        # ---------- 处理 site_map ----------
+        if site_map is None:
+            raise ValueError('site_map 不能为空，它定义了 1240k->参考面板的列映射')
+        self.site_map = np.asarray(site_map, dtype=np.int32)   # length = 1240k
+        self.small_n_var = self.site_map.size
+        self.big_n_var = big_dim if big_dim is not None else (
+            evo_mat.shape[1] if evo_mat is not None else int(self.site_map.max()) + 1)
+
+        # ---------- 样本索引 ----------
         self.indices = indices if indices is not None else np.arange(self.gt_enc.X_gt.shape[0])
 
     def __len__(self):
@@ -370,25 +380,29 @@ class GenomicDataset_Missing(Dataset):
 
     def __getitem__(self, idx):
         real_idx = self.indices[idx]
-        x = self.gt_enc.gts_toarray(real_idx).squeeze()
-        y = x.copy()
 
+        # 1. 取出 1240k 小矩阵的一行  (shape = small_n_var,)
+        x_small = self.gt_enc.gts_toarray(real_idx).squeeze()        # 值域 0..，缺失=-1
+        x_small = x_small.astype(np.int32)
+        x_small[x_small==-1] = self.seq_depth - 1
+
+        # 2. 映射到大矩阵维度
+        x_big = np.full(self.big_n_var, self.seq_depth - 1, dtype=np.int32) # 默认缺失，缺失=self.seq_depth - 1
+        # 只把 site_map 中 >=0 的列搬过去
+        mask_valid = self.site_map >= 0
+        x_big[self.site_map[mask_valid]] = x_small[mask_valid]
+
+        # 3. 后续完全沿用你原来的逻辑
+        y = x_big.copy()
         if self.mask:
-            # 1. 找出“非缺失”下标
-            miss_code = self.seq_depth - 1
-            available = np.flatnonzero(y != miss_code) 
-            if available.size == 0:
-                pass
-            else:
-                # 2. 计算要遮多少
-                masking_rate = np.random.uniform(*self.masking_rates)
-                mask_size = int(len(available) * masking_rate)
-                mask_size = max(1, mask_size) if available.size > 0 else 0
-                # 3. 随机挑选并遮掉
-                mask_indices = np.random.choice(available, mask_size, replace=False)
-                x[mask_indices] = miss_code
+            available = np.flatnonzero(y != self.seq_depth - 1)
+            if available.size > 0:
+                rate = np.random.uniform(*self.masking_rates)
+                n_mask = max(1, int(available.size * rate))
+                mask_idx = np.random.choice(available, n_mask, replace=False)
+                x_big[mask_idx] = self.seq_depth - 1
 
-        x_onehot = torch.FloatTensor(np.eye(self.seq_depth)[x])
+        x_onehot = torch.FloatTensor(np.eye(self.seq_depth)[x_big])
         y_onehot = torch.FloatTensor(np.eye(self.seq_depth)[y])
         return x_onehot, y_onehot, real_idx
 
@@ -418,7 +432,7 @@ class ImputationDataset(Dataset):
         return missing / total if total else 0.
 
     def print_missing_stat(self):
-        print(f'[ImputationDataset] {len(self.indices):,} samples, '
+        print(f'[INFER] {len(self.indices):,} samples, '
               f'missing rate = {self._missing_stat:.2%}')
 
     def __len__(self):

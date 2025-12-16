@@ -25,25 +25,27 @@ from src.data import GenotypeEncoder, GenomicDataset
 from src.loss import ImputationLoss
 
 # ================= 1. 超参数 =================
-MODEL_NAME         = "hg38_chr6"
-WORK_DIR           = Path('/data/home/7240203/EvoFill_data/20251204_chr6/')
+MODEL_NAME         = "hg38_chr22"
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251211_chr22/')
 PRETRAIN_DIR       = WORK_DIR / "train"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 
-TEST_N_SAMPLES     = 128
-BATCH_SIZE         = 16
+TEST_N_SAMPLES     = 64
+BATCH_SIZE         = 4
 MIN_MASK_RATE      = 0.05
 MAX_MASK_RATE      = 0.95
 
 CHUNK_SIZE         = 65536
 OVERLAP            = 1024
-D_MODEL            = 64
-D_STATE            = 64
-HEADDIM            = 64
+D_MODEL            = 128
+D_STATE            = 128
+HEADDIM            = 128
+N_BIMAMBA          = 4
+N_STACK_MAMBA      = 4
 
 MAX_EPOCHS         = 1000
-EARLYSTOP_PATIENCE = 21
-SCHEDULER_FACTOR   = 0.5
+EARLYSTOP_PATIENCE = 23
+SCHEDULER_FACTOR   = 0.1
 SCHEDULER_PATIENCE = 5
 SCHEDULER_MIN_LR   = 1e-8
 SEED               = 3047
@@ -73,6 +75,20 @@ world_size = accelerator.num_processes
 accelerate_set_seed(SEED)
 
 SCHEDULER_PATIENCE = SCHEDULER_PATIENCE * world_size
+
+def find_latest_ckpt(save_dir: Path):
+    if not save_dir.exists():
+        return None
+    dirs = [d for d in save_dir.iterdir()
+            if d.is_dir() and d.name.startswith("checkpoint-stage1-")]
+    if not dirs:
+        return None
+    # 按时间戳排序：先拆出 “1211-193253” 这种子串
+    dirs.sort(key=lambda x: datetime.datetime.strptime(
+              x.name.split("-", 2)[2],   # 取第三段以后
+              "%m%d-%H%M%S"))
+    return dirs[-1]
+
 # -------------- 1. 数据 --------------
 
 gt_enc = GenotypeEncoder.loadfromdisk(PRETRAIN_DIR)
@@ -116,7 +132,7 @@ test_loader = torch.utils.data.DataLoader(
 
 # -------------- 2. 模型 --------------
 
-model_raw = EvoFill(gt_enc.seq_depth, gt_enc.n_variants, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM)
+model_raw = EvoFill(gt_enc.seq_depth, gt_enc.n_variants, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM, N_BIMAMBA, N_STACK_MAMBA)
 
 if accelerator.is_main_process:
     meta = {"model_name":  MODEL_NAME,
@@ -126,11 +142,13 @@ if accelerator.is_main_process:
             "overlap":     OVERLAP,
             "d_model":     D_MODEL,
             "d_state":     D_STATE,
-            "headdim":     HEADDIM,}
+            "headdim":     HEADDIM,
+            "bimamba_layers": N_BIMAMBA,
+            "stack_mamba_layers": N_STACK_MAMBA}
     with open(MODEL_SAVE_DIR / "model_meta.json", "w") as f:
         json.dump(meta, f, indent=4)
 
-# -------------- 3. 拆参数 → 双优化器 --------------
+# -------------- 3. 优化器 --------------
 
 optimizer = AdamW(model_raw.parameters(), lr=LR, betas=BETAS, weight_decay=WD)
 
@@ -144,15 +162,32 @@ model, *opt_sch = accelerator.prepare(
 )
 optimizer, scheduler = opt_sch[:2]
 
+latest_ckpt = find_latest_ckpt(MODEL_SAVE_DIR)
+
+if latest_ckpt is not None:
+    pprint(f"Find previous checkpoint: {latest_ckpt.name}, loading state...")
+    accelerator.load_state(latest_ckpt)
+
+    # 把 best_loss / patience_counter / start_epoch 读回来
+    meta_json = latest_ckpt / "training_meta.json"
+    if meta_json.exists():
+        with open(meta_json, "r") as f:
+            meta = json.load(f)
+        best_loss        = meta.get("best_loss", math.inf)
+        patience_counter = meta.get("patience_counter", 0)
+        start_epoch      = meta.get("epoch", 0) + 1   # 下一 epoch
+    pprint(f"Successfully resume from epoch {start_epoch}, best_loss={best_loss:.4f}, patience={patience_counter}")
+else:
+    start_epoch = 0
+    best_loss = math.inf
+    patience_counter = 0
+    pprint("No checkpoint found, train from scratch.")
 # -------------- 5. Loss --------------
 
 criterion = ImputationLoss(use_r2=True, use_evo=True, r2_weight=1, evo_weight=4, evo_lambda=10)
 
 # -------------- 6. 训练 --------------
-best_loss = math.inf
-patience_counter = 0
-
-for epoch in range(MAX_EPOCHS):
+for epoch in range(start_epoch, MAX_EPOCHS):
     # ---- train ----
     model.train()
     tot_loss = 0.0
@@ -207,6 +242,11 @@ for epoch in range(MAX_EPOCHS):
         ts = datetime.datetime.now().strftime("%m%d-%H%M%S")
         ckpt_path = MODEL_SAVE_DIR / f"checkpoint-stage1-{ts}"
         accelerator.save_state(output_dir=ckpt_path)
+        if accelerator.is_main_process:
+            with open(ckpt_path / "training_meta.json", "w") as f:
+                json.dump({"best_loss": best_loss,
+                            "patience_counter": patience_counter,
+                            "epoch": epoch}, f, indent=4)
         pprint(f"  --> {ts} checkpoint-stage1 updated.")
     else:
         patience_counter += 1

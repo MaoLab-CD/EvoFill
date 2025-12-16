@@ -11,7 +11,7 @@ deepspeed_config:
   stage3_prefetch_bucket_size: 1e8
   stage3_param_persistence_threshold: 1e6
   zero3_save_16bit_model: true
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8
   gradient_clipping: 1.0
   communication_data_type: fp32
   optimizer_fp32: true
