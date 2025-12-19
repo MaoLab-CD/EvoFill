@@ -349,6 +349,88 @@ class GenomicDataset(Dataset):
 
         return x_onehot, y_onehot, real_idx
 
+
+class GenomicDataset_AlignedMask(Dataset):
+    """
+    为1KGP样本生成与AADR对齐的mask模式
+    - AADR不存在的位点：100%缺失
+    - AADR存在的位点：随机保留一部分（模拟AADR的~95%缺失率）
+    """
+    def __init__(self, 
+                 gt_encoder, 
+                 site_map_path: str,  # ADNA_SITE_MAP 文件路径
+                 big_dim: int,         # 参考面板总位点数（19w）
+                 mask_rate_range: tuple = (0.9, 0.99),  # 随机mask的比例范围
+                 evo_mat=None,
+                 indices=None):
+        self.gt_enc = gt_encoder
+        self.evo_mat = evo_mat
+        self.seq_depth = gt_encoder.seq_depth
+        self.indices = indices if indices is not None else np.arange(gt_encoder.X_gt.shape[0])
+        
+        # ========== 核心：预计算对齐掩码 ==========
+        # 加载site_map并转换为布尔掩码
+        site_map = np.load(site_map_path)  # shape: (small_n_var,), 值域: [-1, big_dim)
+        self.shared_mask = np.zeros(big_dim, dtype=bool)  # 在19w维度上的掩码
+        
+        # site_map中>=0的索引对应AADR存在的位点
+        valid_indices = site_map[site_map >= 0]
+        self.shared_mask[valid_indices] = True  # 这1.7w位点是可以被观测的
+        
+        self.n_shared = self.shared_mask.sum()  # 约1.7w
+        self.n_total = big_dim  # 19w
+        self.mask_rate_range = mask_rate_range
+        
+    def __len__(self):
+        return len(self.indices)
+    
+    def _generate_aligned_mask(self, batch_size):
+        """生成对齐的mask矩阵 (bs, n_total)"""
+        # 基础掩码：所有样本共享的盲区（17.3w位点为False）
+        base_mask = np.tile(self.shared_mask, (batch_size, 1))
+        
+        # 计算需要在共享位点中保留的数量
+        # 目标：总稀疏度 = random.uniform(0.9, 0.99)
+        target_sparsity = np.random.uniform(*self.mask_rate_range)
+        # 总保留数 = 总位数 * (1 - 缺失率)
+        n_keep_total = int(self.n_total * (1 - target_sparsity))
+        # 由于17.3w盲区已强制缺失，只能从1.7w中保留
+        # 所以实际保留数 = min(目标保留数, 共享位数)
+        n_keep = min(n_keep_total, self.n_shared)
+        
+        if n_keep > 0:
+            # 对每条样本，在1.7w共享位点中随机选择n_keep个保留
+            shared_indices = np.where(self.shared_mask)[0]  # 1.7w位点的索引
+            for i in range(batch_size):
+                # 随机选择保留位点
+                keep_indices = np.random.choice(shared_indices, size=n_keep, replace=False)
+                # 先全部置False（缺失），再设置保留位点为True
+                base_mask[i, :] = False
+                base_mask[i, keep_indices] = True
+        
+        return base_mask
+    
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        
+        # 1. 取出完整位点数据 (19w,)
+        x = self.gt_enc.gts_toarray(real_idx).squeeze()
+        y = x.copy()
+        
+        # 2. 生成对齐的mask (本样本)
+        # 对于单样本，batch_size=1
+        mask = self._generate_aligned_mask(batch_size=1)[0]  # shape: (n_total,)
+        
+        # 3. 应用mask：mask=False的位置设为缺失值
+        x[~mask] = self.seq_depth - 1
+        
+        # 4. 转换为one-hot
+        x_onehot = torch.FloatTensor(np.eye(self.seq_depth)[x])
+        y_onehot = torch.FloatTensor(np.eye(self.seq_depth - 1)[y])
+        
+        return x_onehot, y_onehot, real_idx
+        
+
 class GenomicDataset_1240k(Dataset):
     """
     读取 1240k 古 DNA 矩阵，getitem 时通过 site_map 映射到参考面板。

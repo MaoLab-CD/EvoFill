@@ -21,13 +21,13 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from accelerate import Accelerator
 from accelerate.utils import set_seed as accelerate_set_seed
 
-from src.data import GenotypeEncoder, GenomicDataset, GenomicDataset_1240k
+from src.data import GenotypeEncoder, GenomicDataset_AlignedMask, GenomicDataset_1240k
 from src.model import EvoFill
 from src.loss import ImputationLoss_Missing
 
 # ================= 1. 超参数 =================
 MODEL_NAME         = "hg38_chr22"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251211_chr22/')
+WORK_DIR           = Path('/data/home/7240203/EvoFill_data/20251211_chr22/')
 PRETRAIN_DIR       = WORK_DIR / "train"
 AUGMENT_DIR        = WORK_DIR / "augment"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
@@ -36,8 +36,8 @@ PRETRAIN_BIN       = MODEL_SAVE_DIR / "pytorch_model_stage1.bin"
 
 TEST_N_SAMPLES     = 128
 BATCH_SIZE         = 4
-MIN_MASK_RATE      = 0.05
-MAX_MASK_RATE      = 0.5
+MIN_MASK_RATE      = 0.90
+MAX_MASK_RATE      = 0.99
 
 CHUNK_SIZE         = 65536
 OVERLAP            = 1024
@@ -74,25 +74,33 @@ SCHEDULER_PATIENCE = SCHEDULER_PATIENCE * world_size
 EARLYSTOP_PATIENCE = EARLYSTOP_PATIENCE * world_size 
 
 # -------------- 1. 数据 --------------
-gt_enc_train = GenotypeEncoder.loadfromdisk(AUGMENT_DIR)
-gt_enc_test  = GenotypeEncoder.loadfromdisk(PRETRAIN_DIR)
+gt_enc_train = GenotypeEncoder.loadfromdisk(PRETRAIN_DIR)
+gt_enc_val  = GenotypeEncoder.loadfromdisk(AUGMENT_DIR)
 
-_, test_idx = train_test_split(
-    range(gt_enc_test.n_samples),
-    test_size=TEST_N_SAMPLES,
-    random_state=SEED,
-    shuffle=True,
-)
+# train_ds = GenomicDataset(
+#     gt_enc_train, evo_mat=gt_enc_train.evo_mat,
+#     mask=True, masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE),
+#     indices=None
+# )
 
-train_ds = GenomicDataset_1240k(
-    gt_enc_train, evo_mat=gt_enc_train.evo_mat, 
-    site_map =  np.load(ADNA_SITE_MAP),
-    big_dim=gt_enc_test.n_variants,
-    mask=True, masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE),
+train_ds = GenomicDataset_AlignedMask(
+    gt_enc_train, 
+    site_map_path=str(ADNA_SITE_MAP),  # 传入AADR映射文件
+    big_dim=gt_enc_train.n_variants,   # 19w
+    mask_rate_range=(MIN_MASK_RATE, MAX_MASK_RATE),
+    evo_mat=gt_enc_train.evo_mat,
     indices=None
 )
-test_ds = GenomicDataset(
-    gt_enc_test, evo_mat=gt_enc_test.evo_mat, mask=False, indices=test_idx
+
+pprint(f"[AlignedMask] 总位点数: {train_ds.n_total:,}, "
+        f"AADR共享位点数: {train_ds.n_shared:,} ({train_ds.n_shared/train_ds.n_total:.1%})")
+
+val_ds = GenomicDataset_1240k(
+    gt_enc_val, evo_mat=gt_enc_val.evo_mat, 
+    site_map = np.load(ADNA_SITE_MAP),
+    big_dim=gt_enc_train.n_variants,
+    mask=False,
+    indices=None
 )
 
 def collate_fn(batch, dataset):
@@ -111,13 +119,13 @@ train_loader = torch.utils.data.DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
     num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=train_ds)
 )
-test_loader = torch.utils.data.DataLoader(
-    test_ds, batch_size=BATCH_SIZE, shuffle=False,
-    num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=test_ds)
+val_loader = torch.utils.data.DataLoader(
+    val_ds, batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=val_ds)
 )
 
-pprint(f"Augment: {gt_enc_train.n_samples:,} samples")
-pprint(f"Test   : {len(test_idx):,} samples")
+pprint(f"Aug: {gt_enc_train.n_samples:,} samples")
+pprint(f"Val: {gt_enc_val.n_samples:,} samples")
 
 # -------------- 2. 模型 --------------
 meta = json.load(open(MODEL_SAVE_DIR / "model_meta.json"))
@@ -137,6 +145,7 @@ state_dict = torch.load(PRETRAIN_BIN, map_location="cpu")
 model_raw.load_state_dict(state_dict)
 
 # -------------- 3. 只解冻 embedding + global_out --------------
+
 trainable_para= []
 # 3.1 GlobalOut 全部
 for name, p in model_raw.global_out.named_parameters():
@@ -152,7 +161,6 @@ for p in model_raw.parameters():
 # 再放开需要的
 for p in trainable_para:
     p.requires_grad = True
-
 
 trainable = 0
 frozen = 0
@@ -176,7 +184,7 @@ scheduler  = ReduceLROnPlateau(optimizer, mode='min', factor=SCHEDULER_FACTOR,
 # -------------- 5. Accelerator 封装 --------------
 model, *opt_sch = accelerator.prepare(
     model_raw, optimizer, scheduler,
-    train_loader, test_loader
+    train_loader, val_loader
 )
 optimizer, scheduler = opt_sch[:2]
 
@@ -212,10 +220,10 @@ else:
     start_epoch = 0
     best_loss = math.inf
     patience_counter = 0
-    pprint("No checkpoint found, train from scratch.")
+    pprint("No checkpoint found, train from previous stage.")
 
 # -------------- 6. Loss --------------
-criterion = ImputationLoss_Missing(use_r2=True, use_evo=True, r2_weight=1, evo_weight=4, evo_lambda=10)
+criterion = ImputationLoss_Missing(use_r2=False, use_evo=True, evo_weight=100, evo_lambda=10)
 
 # -------------- 7. 训练 --------------
 best_loss = math.inf
@@ -227,7 +235,7 @@ for epoch in range(start_epoch, MAX_EPOCHS):
     model.train()
     tot_loss = 0.0
     train_pbar = tqdm(train_loader, disable=not accelerator.is_main_process,
-                      desc=f'Epoch {epoch + 1}/{MAX_EPOCHS}')
+                      desc=f'[1kGP] Epoch {epoch + 1}/{MAX_EPOCHS}')
     for _, (x, y, evo) in enumerate(train_pbar):
         x, y = x.to(device), y.to(device)
         evo = evo.to(device) if evo.numel() else None
@@ -254,26 +262,32 @@ for epoch in range(start_epoch, MAX_EPOCHS):
     model.eval()
     tot_loss = 0.0
     with torch.no_grad():
-        for x, y, evo in test_loader:
+        val_pbar = tqdm(val_loader, disable=not accelerator.is_main_process,
+                    desc=f'[aDNA] Epoch {epoch + 1}/{MAX_EPOCHS}')
+        for _, (x, y, evo) in enumerate(val_pbar):
             x, y = x.to(device), y.to(device)
             evo = evo.to(device) if evo.numel() else None
             batch_loss = 0.0
             for cid in range(model.module.n_chunks):
                 logits, prob, mask_idx = model(x, cid)
-                loss, _ = criterion(logits[:, mask_idx], prob[:, mask_idx],
+                loss, logs = criterion(logits[:, mask_idx], prob[:, mask_idx],
                                     y[:, mask_idx], evo)
                 batch_loss += loss.item()
-            tot_loss += batch_loss / model.module.n_chunks
-    avg_test_loss = tot_loss / len(test_loader)
+
+            avg_batch_loss = batch_loss / model.module.n_chunks
+            tot_loss += avg_batch_loss
+            val_pbar.set_postfix({'loss': avg_batch_loss,
+                        'ce': logs['ce'], 'r2': logs['r2'], 'evo': logs['evo']})
+    avg_val_loss = tot_loss / len(val_loader)
 
     # scheduler / early-stop 保持不变
-    scheduler.step(avg_test_loss)
+    scheduler.step(avg_val_loss)
     pprint(f"Epoch {epoch + 1}/{MAX_EPOCHS}: train={avg_train_loss:.2f} "
-           f"test={avg_test_loss:.2f} lr={optimizer.param_groups[0]['lr']:.2e} pat={patience_counter}")
+           f"test={avg_val_loss:.2f} lr={optimizer.param_groups[0]['lr']:.2e} pat={patience_counter}")
 
     # ---- early stop ----
-    if avg_test_loss < best_loss:
-        best_loss = avg_test_loss
+    if avg_val_loss < best_loss:
+        best_loss = avg_val_loss
         patience_counter = 0
         ts = datetime.datetime.now().strftime("%m%d-%H%M%S")
         ckpt_path = MODEL_SAVE_DIR / f"checkpoint-stage2-{ts}"

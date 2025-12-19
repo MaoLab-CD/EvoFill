@@ -184,7 +184,7 @@ else:
     pprint("No checkpoint found, train from scratch.")
 # -------------- 5. Loss --------------
 
-criterion = ImputationLoss(use_r2=True, use_evo=True, r2_weight=1, evo_weight=4, evo_lambda=10)
+criterion = ImputationLoss(use_r2=True, use_evo=True, r2_weight=1, evo_weight=10, evo_lambda=3)
 
 # -------------- 6. 训练 --------------
 for epoch in range(start_epoch, MAX_EPOCHS):
