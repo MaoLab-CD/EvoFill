@@ -6,7 +6,7 @@ import torch.nn.functional as F
 class ImputationLoss(nn.Module):
     """Custom loss function for genomic imputation"""
 
-    def __init__(self, use_r2=True, use_evo=False, r2_weight=1, evo_weight=1, evo_lambda=1):
+    def __init__(self, use_r2=True, use_evo=False, r2_weight=1, evo_weight=1, evo_lambda=3):
         super().__init__()
         self.use_r2_loss = use_r2
         self.use_evo_loss = use_evo
@@ -107,7 +107,7 @@ class ImputationLoss_Missing(nn.Module):
                  use_evo: bool = False,
                  r2_weight: float = 1.0,
                  evo_weight: float = 1.0,
-                 evo_lambda: float = 1.0):
+                 evo_lambda: float = 3.0):
         super().__init__()
         self.use_r2_loss = use_r2
         self.use_evo_loss = use_evo

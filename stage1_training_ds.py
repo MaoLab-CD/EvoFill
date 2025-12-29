@@ -25,13 +25,13 @@ from src.data import GenotypeEncoder, GenomicDataset
 from src.loss import ImputationLoss
 
 # ================= 1. 超参数 =================
-MODEL_NAME         = "hg38_chr22"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251211_chr22/')
+MODEL_NAME         = "hg38_chr22_IGL"
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251225_chr22_IGL/')
 PRETRAIN_DIR       = WORK_DIR / "train"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 
 TEST_N_SAMPLES     = 64
-BATCH_SIZE         = 4
+BATCH_SIZE         = 8
 MIN_MASK_RATE      = 0.05
 MAX_MASK_RATE      = 0.95
 
@@ -46,14 +46,14 @@ N_STACK_MAMBA      = 4
 MAX_EPOCHS         = 1000
 EARLYSTOP_PATIENCE = 23
 SCHEDULER_FACTOR   = 0.1
-SCHEDULER_PATIENCE = 5
-SCHEDULER_MIN_LR   = 1e-8
+SCHEDULER_PATIENCE = 3
+SCHEDULER_MIN_LR   = 1e-7
 SEED               = 3047
 
 # 优化器专属
 LR          = 1e-3
 BETAS       = (0.9, 0.999)
-WD           = 1e-5
+WD          = 1e-5
 # ==============================================
 
 # -------------- 工具：打印只在主进程 --------------
@@ -94,7 +94,7 @@ def find_latest_ckpt(save_dir: Path):
 gt_enc = GenotypeEncoder.loadfromdisk(PRETRAIN_DIR)
 pprint(f"{gt_enc.n_samples:,} samples, {gt_enc.n_variants:,} variants, {gt_enc.seq_depth} seq-depth.")
 
-train_idx, test_idx = train_test_split(
+train_idx, val_idx = train_test_split(
     range(gt_enc.n_samples),
     test_size=TEST_N_SAMPLES,
     random_state=SEED,
@@ -105,8 +105,8 @@ train_ds = GenomicDataset(
     gt_enc, evo_mat=gt_enc.evo_mat, mask=True,
     masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE), indices=train_idx
 )
-test_ds = GenomicDataset(
-    gt_enc, evo_mat=gt_enc.evo_mat, mask=False, indices=test_idx
+val_ds = GenomicDataset(
+    gt_enc, evo_mat=gt_enc.evo_mat, mask=False, indices=val_idx
 )
 
 def collate_fn(batch, dataset):
@@ -125,9 +125,9 @@ train_loader = torch.utils.data.DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
     num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=train_ds)
 )
-test_loader = torch.utils.data.DataLoader(
-    test_ds, batch_size=BATCH_SIZE, shuffle=False,
-    num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=test_ds)
+val_loader = torch.utils.data.DataLoader(
+    val_ds, batch_size=BATCH_SIZE, shuffle=False,
+    num_workers=4, pin_memory=True, collate_fn=partial(collate_fn, dataset=val_ds)
 )
 
 # -------------- 2. 模型 --------------
@@ -158,7 +158,7 @@ scheduler  = ReduceLROnPlateau(optimizer,  mode='min', factor=SCHEDULER_FACTOR,
 # -------------- 4. Accelerator 封装 --------------
 model, *opt_sch = accelerator.prepare(
     model_raw, optimizer, scheduler,
-    train_loader, test_loader
+    train_loader, val_loader
 )
 optimizer, scheduler = opt_sch[:2]
 
@@ -184,7 +184,8 @@ else:
     pprint("No checkpoint found, train from scratch.")
 # -------------- 5. Loss --------------
 
-criterion = ImputationLoss(use_r2=True, use_evo=True, r2_weight=1, evo_weight=10, evo_lambda=3)
+# criterion = ImputationLoss(use_r2=True, use_evo=True, r2_weight=1, evo_weight=10, evo_lambda=3)
+criterion = ImputationLoss(use_r2=True, use_evo=False)
 
 # -------------- 6. 训练 --------------
 for epoch in range(start_epoch, MAX_EPOCHS):
@@ -219,7 +220,7 @@ for epoch in range(start_epoch, MAX_EPOCHS):
     model.eval()
     tot_loss = 0.0
     with torch.no_grad():
-        for x, y, evo in test_loader:
+        for x, y, evo in val_loader:
             x, y = x.to(device), y.to(device)
             evo = evo.to(device) if evo.numel() else None
             batch_loss = 0.0
@@ -229,15 +230,15 @@ for epoch in range(start_epoch, MAX_EPOCHS):
                                     y[:, mask_idx], evo)
                 batch_loss += loss.item()
             tot_loss += batch_loss / model.module.n_chunks
-    avg_test_loss = tot_loss / len(test_loader)
+    avg_val_loss = tot_loss / len(val_loader)
 
     # scheduler / early-stop 保持不变
-    scheduler.step(avg_test_loss)
+    scheduler.step(avg_val_loss)
     pprint(f"Epoch {epoch + 1}/{MAX_EPOCHS}: train={avg_train_loss:.2f} "
-           f"test={avg_test_loss:.2f} lr={optimizer.param_groups[0]['lr']:.2e} pat={patience_counter}")
+           f"test={avg_val_loss:.2f} lr={optimizer.param_groups[0]['lr']:.2e} pat={patience_counter}")
 
-    if avg_test_loss < best_loss:
-        best_loss = avg_test_loss
+    if avg_val_loss < best_loss:
+        best_loss = avg_val_loss
         patience_counter = 0
         ts = datetime.datetime.now().strftime("%m%d-%H%M%S")
         ckpt_path = MODEL_SAVE_DIR / f"checkpoint-stage1-{ts}"
