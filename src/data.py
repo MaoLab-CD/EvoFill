@@ -8,7 +8,7 @@ from cyvcf2 import VCF
 import scipy.sparse as sp
 from pathlib import Path
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 class GenotypeEncoder:
     # ========= 1. 初始化 =========
@@ -525,3 +525,129 @@ class ImputationDataset(Dataset):
         x = self.gts_sparse[real_idx].toarray().squeeze().astype(np.int8)
         x_onehot = torch.FloatTensor(np.eye(self.seq_depth)[x])
         return x_onehot, real_idx   # 无 y
+
+# ================= 自定义混合采样器 =================
+class MixedRatioSampler(Sampler):
+    """
+    按指定比例混合三类样本的采样器
+    确保每个批次内的样本都来自同一数据集类型，以保证evo_mat的有效性
+    ratio: [1KGP随机mask, 1KGP按1240k panel mask, 1240K样本] 的比例
+    支持DeepSpeed动态epoch种子更新，无需重建DataLoader
+    """
+    def __init__(self, datasets, ratio=(0.4, 0.3, 0.3), num_samples=None, shuffle=True, epoch_seed=None, batch_size=16):
+        assert len(datasets) == 3, "需要三个数据集"
+        assert abs(sum(ratio) - 1.0) < 1e-6, "比例之和必须为1.0"
+        
+        self.datasets = datasets
+        self.ratio = ratio
+        self.num_samples = num_samples
+        self.shuffle = shuffle
+        self.batch_size = batch_size
+        
+        # 支持动态epoch种子更新
+        self._base_epoch_seed = epoch_seed
+        self._current_epoch_seed = epoch_seed
+        self._epoch = 0
+        
+        # 计算每个类型的样本数量
+        if num_samples is None:
+            # 使用最小数据集大小的整数倍
+            min_size = min(len(ds) for ds in self.datasets)
+            self.num_samples = min_size * 10  # 默认取10倍最小数据集大小
+        
+        self.n_per_type = []
+        remaining = self.num_samples
+        for i, r in enumerate(ratio):
+            if i == len(ratio) - 1:  # 最后一个类型
+                count = remaining
+            else:
+                count = int(self.num_samples * r)
+                remaining -= count
+            self.n_per_type.append(count)
+        
+        # 确保每个类型的样本数都能被batch_size整除，且不超过数据集大小
+        for i in range(len(self.n_per_type)):
+            max_samples = (len(self.datasets[i]) // batch_size) * batch_size
+            self.n_per_type[i] = min(self.n_per_type[i], max_samples)
+        
+        # 重新计算总样本数
+        self.total_samples = sum(self.n_per_type)
+    
+    def set_epoch(self, epoch):
+        """动态更新epoch种子，确保DeepSpeed兼容性"""
+        self._epoch = epoch
+        if self._base_epoch_seed is not None:
+            self._current_epoch_seed = self._base_epoch_seed + epoch
+        else:
+            self._current_epoch_seed = None
+    
+    def __iter__(self):
+        # 使用当前epoch种子，确保每轮训练样本不同
+        if self._current_epoch_seed is not None:
+            np.random.seed(self._current_epoch_seed)
+        elif self.shuffle:
+            np.random.seed(None)  # 使用当前时间作为种子
+        
+        batches = []
+        
+        # 为每个数据集类型生成完整的批次
+        for dataset_type, (dataset, count) in enumerate(zip(self.datasets, self.n_per_type)):
+            if len(dataset) == 0 or count == 0:
+                continue
+                
+            dataset_size = len(dataset)
+            n_batches = count // self.batch_size
+            
+            for batch_idx in range(n_batches):
+                # 生成当前批次的样本索引
+                # 确保索引不超过数据集大小
+                batch_indices = np.random.choice(dataset_size, self.batch_size, replace=True)
+                
+                # 为批次中的每个样本添加类型信息标记
+                batch_with_type = [(dataset_type, idx) for idx in batch_indices]
+                batches.append(batch_with_type)
+        
+        # 打乱所有批次（保持每个批次内的样本不变）
+        if self.shuffle:
+            np.random.shuffle(batches)
+        
+        # 将批次展平为单个样本索引迭代器，但保持批次内顺序
+        flattened_indices = []
+        for batch in batches:
+            flattened_indices.extend(batch)
+        
+        # 返回索引迭代器
+        return iter(flattened_indices)
+    
+    def __len__(self):
+        return self.total_samples
+
+# ========== 混合数据集 ==========
+class MixedDataset:
+    """
+    混合数据集，统一接口
+    """
+    def __init__(self, datasets, sampler):
+        self.datasets = datasets
+        self.sampler = sampler
+        
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            dataset_type, dataset_idx = key
+            dataset = self.datasets[dataset_type]
+            # 确保索引不超出数据集大小
+            if dataset_idx >= len(dataset):
+                dataset_idx = dataset_idx % len(dataset)
+            x_onehot, y_onehot, real_idx = dataset[dataset_idx]
+            # 添加数据集类型信息
+            return x_onehot, y_onehot, real_idx, dataset_type
+        else:
+            # 直接索引时返回第一个数据集的样本，类型标记为0
+            dataset = self.datasets[0]
+            if key >= len(dataset):
+                key = key % len(dataset)
+            x_onehot, y_onehot, real_idx = dataset[key]
+            return x_onehot, y_onehot, real_idx, 0
+    
+    def __len__(self):
+        return len(self.sampler)
