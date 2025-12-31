@@ -24,6 +24,9 @@ from src.data import GenotypeEncoder, GenomicDataset, GenomicDataset_AlignedMask
 from src.model import EvoFill
 from src.loss import ImputationLoss
 
+from src.data import ImputationDataset
+from src.utils import precompute_maf, metrics_by_maf, print_maf_stat_df
+
 # ================= 1. 超参数 =================
 MODEL_NAME         = "hg38_chr22"
 # WORK_DIR           = Path('/data/home/7240203/EvoFill_data/20251211_chr22/')
@@ -33,22 +36,19 @@ AUGMENT_DIR        = WORK_DIR / "augment"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 ADNA_SITE_MAP      = AUGMENT_DIR / "aDNA-1kGP_sitesmap.npy"
 
-TEST_URP_DIR       = WORK_DIR / "impute_out"
-
-
 TRAIN_N_SAMPLES    = 10000  # 每轮训练的样本数
 VAL_N_SAMPLES     = 1000   # 验证集样本数
-BATCH_SIZE         = 16
+BATCH_SIZE         = 8
 MIN_MASK_RATE      = 0.85
 MAX_MASK_RATE      = 0.99
 
 CHUNK_SIZE         = 65536
 OVERLAP            = 1024
-D_MODEL            = 64
-D_STATE            = 64
-HEADDIM            = 64
-N_BIMAMBA          = 2
-N_STACK_MAMBA      = 2
+D_MODEL            = 128
+D_STATE            = 128
+HEADDIM            = 128
+N_BIMAMBA          = 4
+N_STACK_MAMBA      = 4
 
 MAX_EPOCHS         = 1000
 EARLYSTOP_PATIENCE = 13
@@ -85,7 +85,10 @@ SCHEDULER_PATIENCE = SCHEDULER_PATIENCE * world_size
 gt_enc_train = GenotypeEncoder.loadfromdisk(PRETRAIN_DIR)
 gt_enc_aug  = GenotypeEncoder.loadfromdisk(AUGMENT_DIR)
 
-gt_enc_test  = GenotypeEncoder.loadfromdisk(TEST_URP_DIR)
+
+gt_enc_imp  = GenotypeEncoder.loadfromdisk(WORK_DIR / "impute_in")
+gt_enc_true = GenotypeEncoder.loadfromdisk(WORK_DIR / "impute_out")
+
 
 # ========== 数据集构建 ==========
 # 1. 1KGP随机mask数据集
@@ -170,15 +173,6 @@ val_1kgp_panel = GenomicDataset_AlignedMask(
     indices=np.random.RandomState(SEED+1).choice(gt_enc_train.n_samples, val_panel_samples, replace=False)
 )
 
-# 6. 测试集 (不对测试集进行分割，直接使用所有样本进行随机mask测试)
-test_dataset = GenomicDataset(
-    gt_enc_test,
-    evo_mat=gt_enc_test.evo_mat,
-    mask=True,
-    masking_rates=(MIN_MASK_RATE, MAX_MASK_RATE),
-    indices=None
-)
-
 def collate_fn(batch, datasets):
     """处理混合数据集的batch"""
     # 检查batch中每个item的长度，支持不同类型的数据集
@@ -229,6 +223,31 @@ pprint(f"Train 混合数据集: 40% 1KGP随机mask + 30% 1KGP panel + 30% 1240K\
         f"1KGP 训练样本总数: {gt_enc_train.n_samples:,}\n"
         f"1240K 训练样本总数: {len(augment_idx):,}\n"
         f"注: 为确保evo_mat有效性，每个批次的{BATCH_SIZE}个样本来自同一数据集类型")
+
+#  -------------- URP 测试集
+imp_dataset = ImputationDataset(
+    x_gts_sparse=gt_enc_imp.X_gt,
+    seq_depth=gt_enc_imp.seq_depth,
+    indices=None                 # 可传入指定样本索引
+)
+imp_dataset.print_missing_stat()          # 查看原始缺失比例
+
+def imp_collate_fn(batch):
+    x_onehot = torch.stack([item[0] for item in batch])
+    real_idx_list = [item[1] for item in batch]
+    return x_onehot, real_idx_list   # 无 y
+    
+imp_loader = torch.utils.data.DataLoader(
+    imp_dataset,
+    batch_size=1,
+    shuffle=False,
+    num_workers=4,
+    pin_memory=True,
+    collate_fn=imp_collate_fn
+)
+imp_y_true = gt_enc_true.X_gt.toarray()
+imp_maf, imp_bin_cnt = precompute_maf(imp_y_true)
+imp_y_true_oh = np.eye(gt_enc_true.seq_depth - 1)[imp_y_true]
 
 # -------------- 2. 模型 --------------
 model_raw = EvoFill(gt_enc_train.seq_depth, gt_enc_train.n_variants, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM, N_BIMAMBA, N_STACK_MAMBA)
@@ -282,20 +301,11 @@ val_loader = torch.utils.data.DataLoader(
     collate_fn=partial(collate_fn, datasets=[val_1kgp_random, val_1kgp_panel, val_1240k])
 )
 
-# 创建测试数据加载器（每轮随机mask，所有样本都测试）
-test_loader = torch.utils.data.DataLoader(
-    test_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,  # 测试集不需要shuffle
-    num_workers=4,
-    pin_memory=True,
-    collate_fn=partial(collate_fn, datasets=[test_dataset])
-)
 
 # -------------- 6. Accelerator 封装 --------------
 model, *opt_sch = accelerator.prepare(
     model_raw, optimizer, scheduler,
-    initial_train_loader, val_loader
+    initial_train_loader, val_loader, imp_loader
 )
 optimizer, scheduler = opt_sch[:2]
 
@@ -386,40 +396,46 @@ for epoch in range(start_epoch, MAX_EPOCHS):
             batch_loss = 0.0
             for cid in range(model.module.n_chunks):
                 logits, prob, mask_idx = model(x, cid)
-            loss, logs = criterion(logits[:, mask_idx], prob[:, mask_idx],
-                                   y[:, mask_idx], evo)
-            batch_loss += loss.item()
+                loss, logs = criterion(logits[:, mask_idx], prob[:, mask_idx],
+                                    y[:, mask_idx], evo)
+                batch_loss += loss.item()
             avg_batch_loss = batch_loss / model.module.n_chunks
             tot_loss += avg_batch_loss
             val_pbar.set_postfix({'loss': avg_batch_loss,
                         'ce': logs['ce'], 'r2': logs['r2'], 'evo': logs['evo']})
     avg_val_loss = tot_loss / len(val_loader)
 
-    # ---- test (不对测试集进行分割，直接使用所有样本进行随机mask测试) ----
+    # ---- test ----
     model.eval()
-    tot_loss = 0.0
+    y_prob = []
+    y_mask = []
     with torch.no_grad():
-        test_pbar = tqdm(test_loader, disable=not accelerator.is_main_process,
-                         desc=f'[TEST ] Epoch {epoch + 1}/{MAX_EPOCHS}')
-        for batch_idx, (x, y, evo) in enumerate(test_pbar):
-            x, y = x.to(device), y.to(device)
-            evo = evo.to(device) if evo.numel() else None
-            batch_loss = 0.0
-            for cid in range(model.module.n_chunks):
-                logits, prob, mask_idx = model(x, cid)
-                loss, logs = criterion(logits[:, mask_idx], prob[:, mask_idx],
-                                       y[:, mask_idx], evo)
-                batch_loss += loss.item()
-            avg_batch_loss = batch_loss / model.module.n_chunks
-            tot_loss += avg_batch_loss
-            test_pbar.set_postfix({'loss': avg_batch_loss,
-                                   'ce': logs['ce'], 'r2': logs['r2'], 'evo': logs['evo']})
-    avg_test_loss = tot_loss / len(test_loader)
+        for x_onehot, real_idx in tqdm(imp_loader, disable=not accelerator.is_main_process,
+                                         desc=f'[TEST ] Epoch {epoch + 1}/{MAX_EPOCHS}'):
+            x_onehot = x_onehot.to(device)
+            _, prob, _ = model(x_onehot)
+            miss_mask = x_onehot[..., -1].bool()
+            y_prob.append(prob)
+            y_mask.append(miss_mask)
+   
+    # 在主进程中执行增强的验证逻辑
+    if accelerator.is_main_process:
+        try:
+            # 转换预测结果
+            y_prob = torch.cat(y_prob, dim=0).cpu().numpy()
+            y_mask = torch.cat(y_mask, dim=0).cpu().numpy()
 
-    # scheduler / early-stop 保持不变
+            bins_metrics = metrics_by_maf(y_prob, imp_y_true_oh, 
+                                                    hap_map=gt_enc_true.hap_map, 
+                                                    maf_vec=imp_maf, mask=y_mask)
+            print_maf_stat_df(imp_bin_cnt, {'val': bins_metrics})
+        except Exception as e:
+            print(f'[TEST ] Enhanced validation failed: {str(e)}')
+
+    # scheduler / early-stop
     scheduler.step(avg_val_loss)
-    pprint(f"Epoch {epoch + 1}/{MAX_EPOCHS}: train={avg_train_loss:.2d} "
-           f"val={avg_val_loss:.2d} test={avg_test_loss:.2d} "
+    pprint(f"Epoch {epoch + 1}/{MAX_EPOCHS}: train={avg_train_loss:.2f} "
+           f"val={avg_val_loss:.2f} "
            f"lr={optimizer.param_groups[0]['lr']:.2e} pat={patience_counter}")
 
     # ---- early stop ----
