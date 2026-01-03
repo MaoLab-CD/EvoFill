@@ -45,7 +45,6 @@ class BiMambaBlock(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-<<<<<<< HEAD
         # 只初始化一个 Mamba2 模块
         self.mamba_forward = Mamba2(
             d_model=d_model,
@@ -61,55 +60,6 @@ class BiMambaBlock(nn.Module):
         )
         self.mamba_backward.conv1d.weight = self.mamba_forward.conv1d.weight
         self.mamba_backward.conv1d.bias   = self.mamba_forward.conv1d.bias
-=======
-    def forward(self, x,  dist_bias: torch.Tensor | None):
-        """
-        x: (N, L, D)          N = n_samples, L = seqlen
-        dist_bias: (N, N)    遗传距离矩阵，作为注意力偏置
-        """
-        N, L, D = x.shape
-        
-        # 确保 dist_bias 与 x 的数据类型一致
-        dist_bias = dist_bias.to(x.dtype) if dist_bias is not None else None
-        
-        qkv = self.qkv(x).reshape(N, L, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)   # (3, N, H, L, Dh)
-        
-        # 确保 q, k, v 的数据类型一致
-        q = q.to(x.dtype)
-        k = k.to(x.dtype)
-        v = v.to(x.dtype)
-        
-        # 转置为 (N, H, L, Dh) -> (H, L, N, Dh) 以便在样本维度计算注意力
-        q = q.permute(1, 2, 0, 3)  # (H, L, N, Dh)
-        k = k.permute(1, 2, 0, 3)  # (H, L, N, Dh)
-        v = v.permute(1, 2, 0, 3)  # (H, L, N, Dh)
-        
-        # 计算注意力分数
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (H, L, N, N)
-        
-        if dist_bias is not None:                       # 只有传了才加偏置
-            dist_bias = dist_bias.to(x.dtype)
-            dist_bias = dist_bias.unsqueeze(0).unsqueeze(0)
-            dist_bias = dist_bias.expand(self.num_heads, L, -1, -1)
-            attn_scores = attn_scores + dist_bias
-        
-        # 计算注意力权重
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout_layer(attn_weights)
-        
-        # 确保注意力权重和 v 的数据类型一致
-        attn_weights = attn_weights.to(v.dtype)
-        
-        # 应用注意力权重
-        out = torch.matmul(attn_weights, v)  # (H, L, N, Dh)
-        
-        # 重新排列维度
-        out = out.permute(2, 0, 1, 3)  # (N, H, L, Dh)
-        out = out.reshape(N, L, -1)  # (N, L, H * Dh)
-        
-        return self.proj(out)
->>>>>>> main
 
         self.gamma = nn.Parameter(init_value * torch.ones(d_model))
         # 其余部分保持不变
@@ -226,34 +176,12 @@ class StackMambaBlock(nn.Module):
             nn.Linear(d_model // 2, d_model),
         )
 
-<<<<<<< HEAD
     def forward(self, local_repr, global_repr,
                 start_offset=0, end_offset=0):
-=======
-    def forward(self, x):
-        return self.net(x)
-
-
-class FlashTransformerBlock(nn.Module):
-    """
-    序列自注意力 + 样本注意力 + FFN
-    """
-    def __init__(self, embed_dim, num_heads, dropout=0.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.seq_attn = FlashMultiHeadAttention(embed_dim, num_heads, dropout)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.sample_attn = SampleFlashAttention(embed_dim, num_heads, dropout)
-        self.norm3 = nn.LayerNorm(embed_dim)
-        self.ffn = FFN(embed_dim, dropout=dropout)
-
-    def forward(self, x, dist_mat: torch.Tensor | None = None):
->>>>>>> main
         """
         local_repr: (B, L, D)
         global_repr: (B, G, D)
         """
-<<<<<<< HEAD
         local_norm  = self.norm1(local_repr)
         global_norm = self.norm2(global_repr)
 
@@ -275,17 +203,6 @@ class FlashTransformerBlock(nn.Module):
         x = x + local_norm
         x = self.norm3(x)
         x = self.ffn(x) + x
-=======
-        # 确保 dist_mat 与 x 的数据类型一致
-        dist_mat = dist_mat.to(x.dtype) if dist_mat is not None else None
-        
-        # 1) 序列维度自注意力
-        x = x + self.seq_attn(self.norm1(x))
-        # 2) 样本维度交叉注意力（遗传距离作为偏置）
-        x = x + self.sample_attn(self.norm2(x), dist_mat)
-        # 3) FFN
-        x = x + self.ffn(self.norm3(x))
->>>>>>> main
         return x
 
 class ChunkModule(nn.Module):
@@ -382,13 +299,8 @@ class UltraLongRangeMamba(nn.Module):
             nn.Linear(d_model // 2, d_model // 2),
             nn.Sigmoid()
         )
-<<<<<<< HEAD
 
     def forward(self, h_local, idx):
-=======
-        
-    def forward(self, x: torch.Tensor, dist_mat: torch.Tensor | None = None):
->>>>>>> main
         """
         h_local: (B, M, d_model//2)  局部特征
         idx:     (M,)                在 0~L-1 的坐标
@@ -405,7 +317,6 @@ class UltraLongRangeMamba(nn.Module):
         x = self.norm(x)
         h_global = x[..., x.size(-1)//2:]               # 取后半截 (B,M,D//2)
 
-<<<<<<< HEAD
         # 3. 门控 + 阈值过滤
         delta = h_global - h_local
         gate = self.gate_proj(delta)
@@ -436,9 +347,6 @@ class GlobalOut(nn.Module):
 
     # ============ 前向：ulr 是可插拔中间件 ============
     def forward(self, x, mask):
-=======
-    def predict(self, x: torch.Tensor, dist_mat: torch.Tensor | None = None):
->>>>>>> main
         """
         x:   (B, L,  2*d_model)
         mask:(L,) 0/1

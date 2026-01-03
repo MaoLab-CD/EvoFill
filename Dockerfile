@@ -40,11 +40,4 @@ RUN pip install --no-cache-dir -U \
         deepspeed \
         mamba-ssm==2.2.5
 
-RUN pip install --no-cache-dir nvitop jupyterlab
-
-RUN jupyter lab --generate-config && \
-    echo "c.ServerApp.token = ''" >> /root/.jupyter/jupyter_lab_config.py && \
-    echo "c.ServerApp.password = ''" >> /root/.jupyter/jupyter_lab_config.py
-
-EXPOSE 8888
-CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]
+CMD ["conda","activate", "evofill"]

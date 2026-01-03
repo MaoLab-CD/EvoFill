@@ -6,3 +6,4 @@ logs/*
 *.tar.gz
 =======
 >>>>>>> main
+__pycache__

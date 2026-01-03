@@ -63,10 +63,7 @@ BETAS       = (0.9, 0.999)
 WD           = 1e-5
 # ============================================================================
 
-import logging
 import os
-# 抑制DeepSpeed的INFO日志
-logging.getLogger("deepspeed").setLevel(logging.WARNING)
 os.environ['OMP_NUM_THREADS'] = '8'
 
 def pprint(*args):
@@ -205,7 +202,7 @@ def collate_fn(batch, datasets):
 # 验证集：40:30:30 混合  
 val_sampler = MixedRatioSampler(
     [val_1kgp_random, val_1kgp_panel, val_1240k],
-    ratio=(0.4, 0.3, 0.3),
+    ratio=(0.6, 0.2, 0.2),
     num_samples=VAL_N_SAMPLES,
     shuffle=False,  # 验证集不需要shuffle
     batch_size=BATCH_SIZE
@@ -215,8 +212,8 @@ val_sampler = MixedRatioSampler(
 train_mixed_ds = MixedDataset([train_1kgp_random, train_1kgp_panel, augment_ds], None)
 val_mixed_ds = MixedDataset([val_1kgp_random, val_1kgp_panel, val_1240k], val_sampler)
 
-pprint(f"Train 混合数据集: 40% 1KGP随机mask + 30% 1KGP panel + 30% 1240K\n"
-        f"Val   混合数据集: 40% 1KGP随机mask + 30% 1KGP panel + 30% 1240K\n"
+pprint(f"Train 混合数据集: 60% 1KGP随机mask + 20% 1KGP panel + 20% 1240K\n"
+        f"Val   混合数据集: 60% 1KGP随机mask + 20% 1KGP panel + 20% 1240K\n"
         f"每轮训练样本数: {TRAIN_N_SAMPLES}\n"
         f"验证样本数: {VAL_N_SAMPLES}\n"
         f"批次大小: {BATCH_SIZE} (每个批次的样本来自同一数据集类型)\n"
