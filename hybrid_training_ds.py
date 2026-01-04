@@ -26,6 +26,7 @@ from src.loss_v2 import ImputationLoss
 
 from src.data import ImputationDataset
 from src.utils import precompute_maf, metrics_by_maf, print_maf_stat_df
+import os; os.environ['OMP_NUM_THREADS'] = '8'
 
 # ================= 1. 超参数 =================
 MODEL_NAME         = "hg38_chr22"
@@ -34,10 +35,10 @@ WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251230_chr22/')
 PRETRAIN_DIR       = WORK_DIR / "train"
 AUGMENT_DIR        = WORK_DIR / "augment"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
-ADNA_SITE_MAP      = AUGMENT_DIR / "aDNA-1kGP_sitesmap.npy"
+ADNA_SITE_MAP      = AUGMENT_DIR / "sitesmap_1240k.npy"
 
 TRAIN_N_SAMPLES    = 10000  # 每轮训练的样本数
-VAL_N_SAMPLES     = 1000   # 验证集样本数
+VAL_N_SAMPLES      = 1000   # 验证集样本数
 BATCH_SIZE         = 8
 MIN_MASK_RATE      = 0.85
 MAX_MASK_RATE      = 0.99
@@ -56,15 +57,12 @@ SCHEDULER_FACTOR   = 0.1
 SCHEDULER_PATIENCE = 3
 SCHEDULER_MIN_LR   = 1e-8
 SEED               = 3047
-HYBRID_RATIO       = (0.6, 0.2, 0.2)
+HYBRID_RATIO       = (0.34, 0.33, 0.33)
 # 优化器专属
 LR          = 1e-3
 BETAS       = (0.9, 0.999)
 WD           = 1e-5
 # ============================================================================
-
-import os
-os.environ['OMP_NUM_THREADS'] = '8'
 
 def pprint(*args):
     if accelerator.is_main_process:
@@ -117,12 +115,12 @@ pprint(f"1KGP 总位点数    : {train_1kgp_panel.n_total:,}, \n"
 # - 1KGP panel: 300个样本  
 # - 1240K: 300个样本
 
-val_1kgp_samples = int(VAL_N_SAMPLES * 0.4)  # 400
-val_panel_samples = int(VAL_N_SAMPLES * 0.3)  # 300
-val_1240k_samples = VAL_N_SAMPLES - val_1kgp_samples - val_panel_samples  # 300
+val_1kgp_samples = int(VAL_N_SAMPLES * HYBRID_RATIO[0])
+val_panel_samples = int(VAL_N_SAMPLES * HYBRID_RATIO[1])
+val_1240k_samples = VAL_N_SAMPLES - val_1kgp_samples - val_panel_samples
 
 # 打印数据集大小信息
-pprint(f"数据集大小信息:")
+pprint("数据集大小信息:")
 pprint(f"  1KGP训练样本总数: {len(train_1kgp_random)}")
 pprint(f"  1KGP panel训练样本总数: {len(train_1kgp_panel)}")
 pprint(f"  1240K训练样本总数: {gt_enc_aug.n_samples}")
@@ -198,8 +196,6 @@ def collate_fn(batch, datasets):
 
 
 # ========== 创建混合数据加载器 ==========
-# 训练集：40:30:30 混合
-# 验证集：40:30:30 混合  
 val_sampler = MixedRatioSampler(
     [val_1kgp_random, val_1kgp_panel, val_1240k],
     ratio=HYBRID_RATIO,
@@ -433,7 +429,7 @@ for epoch in range(start_epoch, MAX_EPOCHS):
     scheduler.step(avg_val_loss)
     pprint(f"Epoch {epoch + 1}/{MAX_EPOCHS}: train={avg_train_loss:.2f} "
            f"val={avg_val_loss:.2f} "
-           f"lr={optimizer.param_groups[0]['lr']:.2e} pat={patience_counter}")
+           f"lr={optimizer.param_groups[0]['lr']:.2e}")
 
     # ---- early stop ----
     if avg_val_loss < best_loss:
@@ -450,6 +446,7 @@ for epoch in range(start_epoch, MAX_EPOCHS):
         pprint(f"  --> {ts} checkpoint updated.")
     else:
         patience_counter += 1
+        pprint(f"patience counter={patience_counter}")
         if patience_counter >= EARLYSTOP_PATIENCE:
             pprint("Early stop!")
             break
