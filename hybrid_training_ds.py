@@ -22,7 +22,7 @@ from accelerate.utils import set_seed as accelerate_set_seed
 
 from src.data import GenotypeEncoder, GenomicDataset, GenomicDataset_AlignedMask, GenomicDataset_1240k, MixedRatioSampler, MixedDataset
 from src.model import EvoFill
-from src.loss import ImputationLoss
+from src.loss_v2 import ImputationLoss
 
 from src.data import ImputationDataset
 from src.utils import precompute_maf, metrics_by_maf, print_maf_stat_df
@@ -56,7 +56,7 @@ SCHEDULER_FACTOR   = 0.1
 SCHEDULER_PATIENCE = 3
 SCHEDULER_MIN_LR   = 1e-8
 SEED               = 3047
-
+HYBRID_RATIO       = (0.6, 0.2, 0.2)
 # 优化器专属
 LR          = 1e-3
 BETAS       = (0.9, 0.999)
@@ -202,7 +202,7 @@ def collate_fn(batch, datasets):
 # 验证集：40:30:30 混合  
 val_sampler = MixedRatioSampler(
     [val_1kgp_random, val_1kgp_panel, val_1240k],
-    ratio=(0.6, 0.2, 0.2),
+    ratio=HYBRID_RATIO,
     num_samples=VAL_N_SAMPLES,
     shuffle=False,  # 验证集不需要shuffle
     batch_size=BATCH_SIZE
@@ -272,7 +272,7 @@ scheduler  = ReduceLROnPlateau(optimizer, mode='min', factor=SCHEDULER_FACTOR,
 # -------------- 5. 创建训练数据加载器 --------------
 initial_train_sampler = MixedRatioSampler(
     [train_1kgp_random, train_1kgp_panel, augment_ds],
-    ratio=(0.4, 0.3, 0.3),
+    ratio=HYBRID_RATIO,
     num_samples=TRAIN_N_SAMPLES,
     shuffle=True,
     epoch_seed=SEED,  # 使用初始种子
