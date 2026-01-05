@@ -524,3 +524,16 @@ def print_maf_stat_df_with95ci(
             df[f"{prefix}_{m}_CI95"] = ci_str
 
     print(df.to_string(index=False))
+
+def find_latest_ckpt(save_dir: Path, prefix: str = "checkpoint-"):
+    if not save_dir.exists():
+        return None
+    dirs = [d for d in save_dir.iterdir()
+            if d.is_dir() and d.name.startswith(prefix)]
+    if not dirs:
+        return None
+    # 按时间戳排序：取后两位时间 "1211-193253"
+    dirs.sort(key=lambda x: datetime.datetime.strptime(
+              "-".join(x.name.split("-")[-2:]),
+              "%m%d-%H%M%S"))
+    return dirs[-1]

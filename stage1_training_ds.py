@@ -18,7 +18,7 @@ from sklearn.model_selection import train_test_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from accelerate import Accelerator
-from accelerate.utils import set_seed as accelerate_set_seed
+from accelerate.utils import set_seed as accelerate_set_seed, find_latest_ckpt
 
 from src.model import EvoFill
 from src.data import GenotypeEncoder, GenomicDataset
@@ -75,19 +75,6 @@ world_size = accelerator.num_processes
 accelerate_set_seed(SEED)
 
 SCHEDULER_PATIENCE = SCHEDULER_PATIENCE * world_size
-
-def find_latest_ckpt(save_dir: Path):
-    if not save_dir.exists():
-        return None
-    dirs = [d for d in save_dir.iterdir()
-            if d.is_dir() and d.name.startswith("checkpoint-stage1-")]
-    if not dirs:
-        return None
-    # 按时间戳排序：先拆出 “1211-193253” 这种子串
-    dirs.sort(key=lambda x: datetime.datetime.strptime(
-              x.name.split("-", 2)[2],   # 取第三段以后
-              "%m%d-%H%M%S"))
-    return dirs[-1]
 
 # -------------- 1. 数据 --------------
 
@@ -162,7 +149,7 @@ model, *opt_sch = accelerator.prepare(
 )
 optimizer, scheduler = opt_sch[:2]
 
-latest_ckpt = find_latest_ckpt(MODEL_SAVE_DIR)
+latest_ckpt = find_latest_ckpt(MODEL_SAVE_DIR, prefix="checkpoint-stage1")
 
 if latest_ckpt is not None:
     pprint(f"Find previous checkpoint: {latest_ckpt.name}, loading state...")

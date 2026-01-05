@@ -106,7 +106,7 @@ class ImputationLoss_Missing(nn.Module):
                  use_r2: bool = True,
                  use_evo: bool = False,
                  r2_weight: float = 1.0,
-                 evo_weight: float = 1.0,
+                 evo_weight: float = 1e4,
                  evo_lambda: float = 3.0):
         super().__init__()
         self.use_r2_loss = use_r2

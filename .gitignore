@@ -2,8 +2,6 @@ data/*
 ckpt*
 src/__pycache__/*
 logs/*
-<<<<<<< HEAD
 *.tar.gz
-=======
->>>>>>> main
 __pycache__
+_deprecated/*

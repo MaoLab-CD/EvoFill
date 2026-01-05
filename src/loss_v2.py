@@ -10,15 +10,15 @@ class ImputationLoss(nn.Module):
         BATCH_SIZE  : B
         N_LOCUS     : L   （位点数）
         N_CLASS     : C   （变异类型数，不含缺失）
-        N_CLASS_FULL: C(+1) （可能含缺失）
+        N_CLASS_FULL: C+1 （含缺失）
     """
 
     def __init__(self,
                  use_r2: bool = True,
                  use_evo: bool = False,
-                 r2_weight: float = 0.1,
-                 evo_weight: float = 10,
-                 evo_lambda: float = 2.0):
+                 r2_weight: float = 1.0,
+                 evo_weight: float = 50.0,
+                 evo_lambda: float = 3.0):
         super().__init__()
         self.use_r2_loss = use_r2
         self.use_evo_loss = use_evo
@@ -77,14 +77,6 @@ class ImputationLoss(nn.Module):
                                   ignore_index=N_CLASS,
                                   reduction='sum')
         
-        # 计算有效位点数（非缺失的位点数量）
-        nonmiss_mask = (lbl != N_CLASS)
-        valid_loci_count = nonmiss_mask.sum()
-        
-        # 按有效位点数平均交叉熵损失
-        if valid_loci_count > 0:
-            ce_loss = ce_loss / valid_loci_count
-        
         # 2. R² 损失
         r2_loss = torch.zeros((), device=DEVICE)
         if self.use_r2_loss:
@@ -97,7 +89,6 @@ class ImputationLoss(nn.Module):
                 prob_grp = prob[:N_FULL_GROUPS * GROUP_SIZE].view(
                     N_FULL_GROUPS, GROUP_SIZE, N_LOCUS, N_CLASS)
                 r2_sum = 0.
-                total_valid_r2_loci = 0
                 for g in range(N_FULL_GROUPS):
                     # 1) 非缺失掩码 (GROUP_SIZE, N_LOCUS)
                     nonmiss_mask = (y_true_grp[g].argmax(-1) != N_CLASS)
@@ -111,49 +102,90 @@ class ImputationLoss(nn.Module):
                     pred_alt = prob_grp[g, :, :, 1:N_CLASS].sum(-1)  # (G_SIZE, L)
                     pred_alt = pred_alt.mean(0)                      # (L,)
                     # 6) 计算 R²
-                    group_r2 = -self._calculate_minimac_r2(
-                        pred_alt, af, ~nonmiss_mask)  # (L,)
-                    # 统计该group中有效的R²计算位点（非缺失且非0的位点）
-                    group_valid_mask = (nonmiss_mask.sum(0) > 0) & (group_r2 != 0)
-                    group_valid_count = group_valid_mask.sum()
-                    # 累加有效的R²损失和位点数
-                    r2_sum += group_r2.sum()
-                    total_valid_r2_loci += group_valid_count
+                    r2_sum += -self._calculate_minimac_r2(
+                        pred_alt, af, ~nonmiss_mask).sum() * GROUP_SIZE
 
-                # 按有效位点数平均R²损失
-                if total_valid_r2_loci > 0:
-                    r2_loss = self.r2_weight * (r2_sum / total_valid_r2_loci)
-                else:
-                    r2_loss = self.r2_weight * r2_sum
+                r2_loss = self.r2_weight * r2_sum / BATCH_SIZE
 
         # 3. 演化损失
         evo_loss = torch.zeros((), device=DEVICE)
         if self.use_evo_loss and y_evo_mat is not None:
             nonmiss = (y_true.argmax(-1) != N_CLASS)          # (BATCH_SIZE, N_LOCUS)
+            lbl = y_true.argmax(-1)
             same_gt = (lbl.unsqueeze(1) == lbl.unsqueeze(0))  # (BATCH_SIZE, BATCH_SIZE, N_LOCUS)
-            mask = nonmiss.unsqueeze(1) & nonmiss.unsqueeze(0) & same_gt
+            diff_gt = ~same_gt & (lbl.unsqueeze(1) != N_CLASS) & (lbl.unsqueeze(0) != N_CLASS)
 
-            js = torch.zeros(BATCH_SIZE, BATCH_SIZE, device=DEVICE)
+            valid_pair = nonmiss.unsqueeze(1) & nonmiss.unsqueeze(0)  # (B, B, L)
+            valid_same = valid_pair & same_gt   # (B, B, L)
+            valid_diff = valid_pair & diff_gt   # (B, B, L)
+
+            js_all = torch.zeros(BATCH_SIZE, BATCH_SIZE, N_LOCUS, device=DEVICE)
             for i in range(BATCH_SIZE):
                 for j in range(BATCH_SIZE):
-                    msk = mask[i, j]
-                    if msk.sum() == 0:
+                    mask_ij = nonmiss[i] & nonmiss[j]
+                    if mask_ij.sum() == 0:
                         continue
-                    js[i, j] = (self._js_div(prob[i], prob[j]) * msk).sum()
+                    js_ij = self._js_div(prob[i], prob[j])
+                    js_all[i, j] = js_ij
 
-            w = torch.exp(-self.evo_lambda * y_evo_mat)
-            w = w / (w.sum(1, keepdim=True) + self.eps)
-            evo_loss_sum = (w * js).sum()
+            valid_count_same = valid_same.sum(-1).clamp_min(1)
+            valid_count_diff = valid_diff.sum(-1).clamp_min(1)
 
-            evo_loss = self.evo_weight * (evo_loss_sum / BATCH_SIZE)
-            
+            js_mean_same = (js_all * valid_same).sum(-1) / valid_count_same
+            js_mean_diff = (js_all * valid_diff).sum(-1) / valid_count_diff
+
+            evo_weight_mat = torch.exp(-self.evo_lambda * y_evo_mat)
+            evo_weight_mat = evo_weight_mat / (evo_weight_mat.sum(1, keepdim=True) + self.eps)
+
+            # 计算实际的valid比较数量（每对样本对之间有多少个valid loci）
+            # shape: (BATCH_SIZE, BATCH_SIZE)
+            n_valid_per_pair_same = valid_count_same  # 每个(i,j)对之间same mutation的valid loci数量
+            n_valid_per_pair_diff = valid_count_diff  # 每个(i,j)对之间diff mutation的valid loci数量
+
+            # 远缘权重 = 1 - 近缘权重
+            far_weight = 1.0 - evo_weight_mat
+
+            # 计算每个(i,j)对的loss贡献
+            # evo_weight_mat[j]表示样本i对样本j的期望权重（距离越近权重越大）
+            # loss_same[i,j] = evo_weight_mat[i,j] * js_mean_same[i,j]
+            # 对于近缘样本(i,j)，evo_weight大，js_mean应该小
+            loss_per_pair_same = evo_weight_mat * js_mean_same  # (B, B)
+            loss_per_pair_diff = far_weight * (1 - js_mean_diff)  # (B, B)
+
+            # 加权求和，每个pair的贡献乘以该pair之间的valid loci数量
+            total_loss_same = (loss_per_pair_same * n_valid_per_pair_same).sum()
+            total_loss_diff = (loss_per_pair_diff * n_valid_per_pair_diff).sum()
+
+            # 总的valid比较数量
+            total_valid_same = n_valid_per_pair_same.sum().clamp_min(1)
+            total_valid_diff = n_valid_per_pair_diff.sum().clamp_min(1)
+
+            # 平均每个valid比较的loss
+            avg_loss_same = total_loss_same / total_valid_same
+            avg_loss_diff = total_loss_diff / total_valid_diff
+
+            # 综合evo_loss：近缘same应一致，远缘diff应不一致
+            avg_evo_loss = (avg_loss_same + avg_loss_diff) / 2.0
+
+            # Scale factor策略：
+            # CE loss使用reduction='sum'，量级~B*N_LOCUS
+            # 为了让evo_loss有相似量级，evo_loss也应该~B*N_LOCUS
+            # avg_evo_loss是每个valid比较的平均JS divergence（~0.1-1.0）
+            # 需要scale_factor来放大到~B*N_LOCUS量级
+            scale_factor = BATCH_SIZE * N_LOCUS
+
+            # 先计算原始evo_loss，再归一化到和其他loss相同量级
+            raw_evo_loss = avg_evo_loss * scale_factor
+
+            # 除以BATCH_SIZE使evo_loss量级与CE loss一致（都是per-sample sum）
+            evo_loss = self.evo_weight * raw_evo_loss / BATCH_SIZE
             if not torch.isfinite(evo_loss):
-                evo_loss = torch.tensor(0., device=evo_loss.device)
+                evo_loss = torch.tensor(0., device=DEVICE)
 
         logs = {'ce': ce_loss.item(),
                 'r2': r2_loss.item(),
                 'evo': evo_loss.item()}
-        total_loss = 1000*(ce_loss + r2_loss + evo_loss)
+        total_loss = ce_loss + r2_loss + evo_loss
         return total_loss, logs
 
 if __name__ == "__main__":

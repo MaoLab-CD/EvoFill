@@ -1,62 +1,27 @@
 # EvoFill: Evolutionary Trajectory-Informed Genotype Imputation
 
-**内部开发中**
-
-Pingcode：https://pchz20250707025859383.pingcode.com/ship/products/JYX
-
-GitHub 仓库不包含`./data`，`./ckpt` 等数据文件夹
-
-完整本地项目请见：`192.168.10.5:/mnt/qmtang/EvoFill/`
-
 ## Installation and configuration
 
+with conda virtual environment:
 ``` bash
-conda create -f environment.yml
+conda create -n evofill -f env.yml
 conda activate evofill
+```
+
+with docker images:
+``` bash
+docker build -t evofill .
 ```
 
 ## Dataset preparation
 
-1.  split training and validation set
+1. partition the 1kGP dataset into major population (training) and under-represented population (test) set: `notebook/1kGP_partition.ipynb`
 
-``` bash
-bash scripts/split_vcf.sh
-```
+2. merge Asian and Eastsourthen-Asian samples in AADR, Shimao(石峁) and Tibitan sample together as `1240k-panel` sample for augmentation: `notebook/merge_1240k_samples.ipynb`
 
-2.  calculate the p-distance among samples:
+## Tutorial for model training and imputation
 
-``` bash
-Vcf2Dis -InPut training_vcf.gz -OutPut training.p_dis.mat
-Vcf2Dis -InPut val_vcf.gz -OutPut val.p_dis.mat
-```
-
-3.  Convert vcf to tensor
-
-``` bash
-python src/vcf2tensor.py
-```
-
-## Training
-
-1.  config the model and training process
-
-2a. strat training in local
-
-``` bash
-deepspeed train.py --deepspeed config/ds_config.json
-```
-
-2b. strat training in cluster
-
-``` bash
-deepspeed train.py --deepspeed config/ds_config.json
-```
-
-3.  monitor the training
-
-``` bash
-[todo]
-```
+please following: `tuorial.ipynb`
 
 ## Imputation
 
@@ -64,8 +29,5 @@ deepspeed train.py --deepspeed config/ds_config.json
 python imputation.py
 ```
 
-## Results visualization
+## Cite
 
-``` bash
-jupyter notebook ...
-```

@@ -18,11 +18,11 @@ from functools import partial
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from accelerate import Accelerator
-from accelerate.utils import set_seed as accelerate_set_seed
+from accelerate.utils import set_seed as accelerate_set_seed, find_latest_ckpt
 
 from src.data import GenotypeEncoder, GenomicDataset, GenomicDataset_AlignedMask, GenomicDataset_1240k, MixedRatioSampler, MixedDataset
 from src.model import EvoFill
-from src.loss_v2 import ImputationLoss
+from src.loss_v1 import ImputationLoss_Missing as ImputationLoss
 
 from src.data import ImputationDataset
 from src.utils import precompute_maf, metrics_by_maf, print_maf_stat_df
@@ -59,9 +59,9 @@ SCHEDULER_MIN_LR   = 1e-8
 SEED               = 3047
 HYBRID_RATIO       = (0.34, 0.33, 0.33)
 # 优化器专属
-LR          = 1e-3
-BETAS       = (0.9, 0.999)
-WD           = 1e-5
+LR                 = 1e-3
+BETAS              = (0.9, 0.999)
+WD                 = 1e-5
 # ============================================================================
 
 def pprint(*args):
@@ -208,8 +208,8 @@ val_sampler = MixedRatioSampler(
 train_mixed_ds = MixedDataset([train_1kgp_random, train_1kgp_panel, augment_ds], None)
 val_mixed_ds = MixedDataset([val_1kgp_random, val_1kgp_panel, val_1240k], val_sampler)
 
-pprint(f"Train 混合数据集: 60% 1KGP随机mask + 20% 1KGP panel + 20% 1240K\n"
-        f"Val   混合数据集: 60% 1KGP随机mask + 20% 1KGP panel + 20% 1240K\n"
+pprint(f"Train 混合数据集: {HYBRID_RATIO[0]*100:.1f}% 1KGP随机mask + {HYBRID_RATIO[1]*100:.1f}% 1KGP panel + {HYBRID_RATIO[2]*100:.1f}% 1240K\n"
+        f"Val   混合数据集: {HYBRID_RATIO[0]*100:.1f}% 1KGP随机mask + {HYBRID_RATIO[1]*100:.1f}% 1KGP panel + {HYBRID_RATIO[2]*100:.1f}% 1240K\n"
         f"每轮训练样本数: {TRAIN_N_SAMPLES}\n"
         f"验证样本数: {VAL_N_SAMPLES}\n"
         f"批次大小: {BATCH_SIZE} (每个批次的样本来自同一数据集类型)\n"
@@ -242,22 +242,39 @@ imp_y_true = gt_enc_true.X_gt.toarray()
 imp_maf, imp_bin_cnt = precompute_maf(imp_y_true)
 imp_y_true_oh = np.eye(gt_enc_true.seq_depth - 1)[imp_y_true]
 
-# -------------- 2. 模型 --------------
-model_raw = EvoFill(gt_enc_train.seq_depth, gt_enc_train.n_variants, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM, N_BIMAMBA, N_STACK_MAMBA)
+# # -------------- 2. 模型 --------------
+# model_raw = EvoFill(gt_enc_train.seq_depth, gt_enc_train.n_variants, CHUNK_SIZE, OVERLAP, D_MODEL, D_STATE, HEADDIM, N_BIMAMBA, N_STACK_MAMBA)
 
-if accelerator.is_main_process:
-    meta = {"model_name":  MODEL_NAME,
-            "alleles":     gt_enc_train.seq_depth,
-            "total_sites": gt_enc_train.n_variants,
-            "chunk_size":  CHUNK_SIZE,
-            "overlap":     OVERLAP,
-            "d_model":     D_MODEL,
-            "d_state":     D_STATE,
-            "headdim":     HEADDIM,
-            "bimamba_layers": N_BIMAMBA,
-            "stack_mamba_layers": N_STACK_MAMBA}
-    with open(MODEL_SAVE_DIR / "model_meta.json", "w") as f:
-        json.dump(meta, f, indent=4)
+# if accelerator.is_main_process:
+#     meta = {"model_name":  MODEL_NAME,
+#             "alleles":     gt_enc_train.seq_depth,
+#             "total_sites": gt_enc_train.n_variants,
+#             "chunk_size":  CHUNK_SIZE,
+#             "overlap":     OVERLAP,
+#             "d_model":     D_MODEL,
+#             "d_state":     D_STATE,
+#             "headdim":     HEADDIM,
+#             "bimamba_layers": N_BIMAMBA,
+#             "stack_mamba_layers": N_STACK_MAMBA}
+#     with open(MODEL_SAVE_DIR / "model_meta.json", "w") as f:
+#         json.dump(meta, f, indent=4)
+
+# -------------- 2. 模型 --------------
+meta = json.load(open(MODEL_SAVE_DIR / "model_meta.json"))
+model_raw = EvoFill(
+                    n_alleles=int(meta["alleles"]),
+                    total_sites=int(meta["total_sites"]),
+                    chunk_size=int(meta["chunk_size"]),
+                    chunk_overlap=int(meta["overlap"]),
+                    d_model=int(meta["d_model"]),
+                    d_state=int(meta["d_state"]),
+                    headdim=int(meta["headdim"]),
+                    bimamba_layers=int(meta["bimamba_layers"]),
+                    stack_mamba_layers=int(meta["stack_mamba_layers"])
+                ).to(device)
+
+state_dict = torch.load("/mnt/qmtang/EvoFill_data/20251211_chr22/models/pytorch_model_stage1.bin", map_location="cpu")
+model_raw.load_state_dict(state_dict)
 
 # -------------- 4. 优化器 --------------
 optimizer = AdamW(model_raw.parameters(), lr=LR, betas=BETAS, weight_decay=WD)
@@ -302,20 +319,7 @@ model, *opt_sch = accelerator.prepare(
 )
 optimizer, scheduler = opt_sch[:2]
 
-def find_latest_ckpt(save_dir: Path):
-    if not save_dir.exists():
-        return None
-    dirs = [d for d in save_dir.iterdir()
-            if d.is_dir() and d.name.startswith("checkpoint-")]
-    if not dirs:
-        return None
-    # 按时间戳排序：先拆出 “1211-193253” 这种子串
-    dirs.sort(key=lambda x: datetime.datetime.strptime(
-              x.name.split("-", 2)[2],   # 取第三段以后
-              "%m%d-%H%M%S"))
-    return dirs[-1]
-
-latest_ckpt = find_latest_ckpt(MODEL_SAVE_DIR)
+latest_ckpt = find_latest_ckpt(MODEL_SAVE_DIR, prefix="checkpoint-stage2")
 
 if latest_ckpt is not None:
     pprint(f"Find previous checkpoint: {latest_ckpt.name}, loading state...")
@@ -338,6 +342,35 @@ else:
 
 # -------------- 6. Loss --------------
 criterion = ImputationLoss(use_r2=True, use_evo=True)
+
+
+# -------------- 6. URP test --------------
+
+y_prob = []
+y_mask = []
+with torch.no_grad():
+    for x_onehot, real_idx in tqdm(imp_loader, disable=not accelerator.is_main_process,
+                                        desc=f'[ CDX ]'):
+        x_onehot = x_onehot.to(device)
+        _, prob, _ = model(x_onehot)
+        miss_mask = x_onehot[..., -1].bool()
+        y_prob.append(prob)
+        y_mask.append(miss_mask)
+
+# 在主进程中执行增强的验证逻辑
+if accelerator.is_main_process:
+    try:
+        # 转换预测结果
+        y_prob = torch.cat(y_prob, dim=0).cpu().numpy()
+        y_mask = torch.cat(y_mask, dim=0).cpu().numpy()
+
+        bins_metrics = metrics_by_maf(y_prob, imp_y_true_oh, 
+                                                hap_map=gt_enc_true.hap_map, 
+                                                maf_vec=imp_maf, mask=y_mask)
+        print_maf_stat_df(imp_bin_cnt, {'val': bins_metrics})
+    except Exception as e:
+        print(f'[TEST ] Enhanced validation failed: {str(e)}')
+
 
 # -------------- 7. 训练 --------------
 best_loss = math.inf
@@ -404,7 +437,7 @@ for epoch in range(start_epoch, MAX_EPOCHS):
     y_mask = []
     with torch.no_grad():
         for x_onehot, real_idx in tqdm(imp_loader, disable=not accelerator.is_main_process,
-                                         desc=f'[TEST ] Epoch {epoch + 1}/{MAX_EPOCHS}'):
+                                         desc=f'[ CDX ] Epoch {epoch + 1}/{MAX_EPOCHS}'):
             x_onehot = x_onehot.to(device)
             _, prob, _ = model(x_onehot)
             miss_mask = x_onehot[..., -1].bool()
@@ -423,7 +456,7 @@ for epoch in range(start_epoch, MAX_EPOCHS):
                                                     maf_vec=imp_maf, mask=y_mask)
             print_maf_stat_df(imp_bin_cnt, {'val': bins_metrics})
         except Exception as e:
-            print(f'[TEST ] Enhanced validation failed: {str(e)}')
+            print(f'[ CDX ] Enhanced validation failed: {str(e)}')
 
     # scheduler / early-stop
     scheduler.step(avg_val_loss)
