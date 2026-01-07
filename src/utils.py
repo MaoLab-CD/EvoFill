@@ -3,6 +3,7 @@ import shutil
 import numpy as np
 import torch
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 import random
@@ -532,8 +533,6 @@ def find_latest_ckpt(save_dir: Path, prefix: str = "checkpoint-"):
             if d.is_dir() and d.name.startswith(prefix)]
     if not dirs:
         return None
-    # 按时间戳排序：取后两位时间 "1211-193253"
-    dirs.sort(key=lambda x: datetime.datetime.strptime(
-              "-".join(x.name.split("-")[-2:]),
-              "%m%d-%H%M%S"))
+    # 按 epoch 排序：取最后一段数字
+    dirs.sort(key=lambda x: int(x.name.split("-")[-1]))
     return dirs[-1]

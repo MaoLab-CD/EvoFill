@@ -227,20 +227,21 @@ for epoch in range(start_epoch, MAX_EPOCHS):
     if avg_val_loss < best_loss:
         best_loss = avg_val_loss
         patience_counter = 0
-        ts = datetime.datetime.now().strftime("%m%d-%H%M%S")
-        ckpt_path = MODEL_SAVE_DIR / f"checkpoint-stage1-{ts}"
+        ckpt_path = MODEL_SAVE_DIR / f"checkpoint-stage1-{epoch}"
         accelerator.save_state(output_dir=ckpt_path)
         if accelerator.is_main_process:
             with open(ckpt_path / "training_meta.json", "w") as f:
                 json.dump({"best_loss": best_loss,
                             "patience_counter": patience_counter,
                             "epoch": epoch}, f, indent=4)
-        pprint(f"  --> {ts} checkpoint-stage1 updated.")
+        pprint(f"  --> Checkpoint updated at epoch {epoch}.")
     else:
         patience_counter += 1
+        pprint(f"patience counter={patience_counter}")
         if patience_counter >= EARLYSTOP_PATIENCE:
             pprint("Early stop!")
             break
 
 # -------------- 7. 保存最终模型 --------------
 accelerator.wait_for_everyone()
+pprint("==> Stage1: Pretraining Finished <==")

@@ -319,7 +319,7 @@ model, *opt_sch = accelerator.prepare(
 )
 optimizer, scheduler = opt_sch[:2]
 
-latest_ckpt = find_latest_ckpt(MODEL_SAVE_DIR, prefix="checkpoint-stage2")
+latest_ckpt = find_latest_ckpt(MODEL_SAVE_DIR, prefix="checkpoint-stage2-")
 
 if latest_ckpt is not None:
     pprint(f"Find previous checkpoint: {latest_ckpt.name}, loading state...")
@@ -386,7 +386,7 @@ for epoch in range(start_epoch, MAX_EPOCHS):
     model.train()
     tot_loss = 0.0
     train_pbar = tqdm(initial_train_loader, disable=not accelerator.is_main_process,
-                      desc=f'[TRAIN] Epoch {epoch + 1}/{MAX_EPOCHS}')
+                      desc=f'Epoch {epoch + 1}/{MAX_EPOCHS} [TRAIN]')
     for batch_idx, (x, y, evo) in enumerate(train_pbar):
         x, y = x.to(device), y.to(device)
         evo = evo.to(device) if evo.numel() else None
@@ -415,7 +415,7 @@ for epoch in range(start_epoch, MAX_EPOCHS):
     tot_loss = 0.0
     with torch.no_grad():
         val_pbar = tqdm(val_loader, disable=not accelerator.is_main_process,
-                    desc=f'[VALID] Epoch {epoch + 1}/{MAX_EPOCHS}')
+                    desc=f'Epoch {epoch + 1}/{MAX_EPOCHS} [VALID]')
         for batch_idx, (x, y, evo) in enumerate(val_pbar):
             x, y = x.to(device), y.to(device)
             evo = evo.to(device) if evo.numel() else None
@@ -437,7 +437,7 @@ for epoch in range(start_epoch, MAX_EPOCHS):
     y_mask = []
     with torch.no_grad():
         for x_onehot, real_idx in tqdm(imp_loader, disable=not accelerator.is_main_process,
-                                         desc=f'[ CDX ] Epoch {epoch + 1}/{MAX_EPOCHS}'):
+                                         desc=f'Epoch {epoch + 1}/{MAX_EPOCHS} [ CDX ]'):
             x_onehot = x_onehot.to(device)
             _, prob, _ = model(x_onehot)
             miss_mask = x_onehot[..., -1].bool()
@@ -468,15 +468,14 @@ for epoch in range(start_epoch, MAX_EPOCHS):
     if avg_val_loss < best_loss:
         best_loss = avg_val_loss
         patience_counter = 0
-        ts = datetime.datetime.now().strftime("%m%d-%H%M%S")
-        ckpt_path = MODEL_SAVE_DIR / f"checkpoint-{ts}"
+        ckpt_path = MODEL_SAVE_DIR / f"checkpoint-stage2-{epoch}"
         accelerator.save_state(output_dir=ckpt_path)
         if accelerator.is_main_process:
             with open(ckpt_path / "training_meta.json", "w") as f:
                 json.dump({"best_loss": best_loss,
                             "patience_counter": patience_counter,
                             "epoch": epoch}, f, indent=4)
-        pprint(f"  --> {ts} checkpoint updated.")
+        pprint(f"  --> Checkpoint updated at epoch {epoch}.")
     else:
         patience_counter += 1
         pprint(f"patience counter={patience_counter}")
@@ -486,4 +485,4 @@ for epoch in range(start_epoch, MAX_EPOCHS):
 
 # -------------- 8. 最终保存 --------------
 accelerator.wait_for_everyone()
-pprint("==> Hybrid Training Finished <==")
+pprint("==> Stage2: Hybrid Training Finished <==")
