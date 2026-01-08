@@ -18,14 +18,14 @@ from functools import partial
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from accelerate import Accelerator
-from accelerate.utils import set_seed as accelerate_set_seed, find_latest_ckpt
+from accelerate.utils import set_seed as accelerate_set_seed
 
 from src.data import GenotypeEncoder, GenomicDataset, GenomicDataset_AlignedMask, GenomicDataset_1240k, MixedRatioSampler, MixedDataset
 from src.model import EvoFill
 from src.loss_v1 import ImputationLoss_Missing as ImputationLoss
 
 from src.data import ImputationDataset
-from src.utils import precompute_maf, metrics_by_maf, print_maf_stat_df
+from src.utils import precompute_maf, metrics_by_maf, print_maf_stat_df, find_latest_ckpt
 import os; os.environ['OMP_NUM_THREADS'] = '8'
 
 # ================= 1. 超参数 =================

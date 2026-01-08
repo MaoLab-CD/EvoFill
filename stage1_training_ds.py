@@ -18,11 +18,12 @@ from sklearn.model_selection import train_test_split
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from accelerate import Accelerator
-from accelerate.utils import set_seed as accelerate_set_seed, find_latest_ckpt
+from accelerate.utils import set_seed as accelerate_set_seed
 
 from src.model import EvoFill
 from src.data import GenotypeEncoder, GenomicDataset
 from src.loss_v1 import ImputationLoss
+from src.utils import find_latest_ckpt
 
 # ================= 1. 超参数 =================
 MODEL_NAME         = "hg38_chr22_IGL"
