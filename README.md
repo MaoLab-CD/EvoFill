@@ -1,6 +1,5 @@
 # EvoFill: Evolution-aware state space model for genotype imputation
 
-![GitHub](https://img.shields.io/github/license/MaoLab-CD/EvoFill)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 
 ## 📋 Project Overview
@@ -57,7 +56,7 @@ If you need to retrain the model, follow these steps:
 EvoFill can directly use pre-trained weights from Hugging Face for inference, eliminating the need for training from scratch:
 
 1. **Download Pre-trained Weights**:
-   - Access the model weights on Hugging Face: [EvoFill Model](https://huggingface.co/yourusername/evofill)
+   - Access the model weights on Hugging Face: [EvoFill Model](https://huggingface.co/syaoran036/EvoFill)
    - Follow the instructions to download and load the weights
 
 2. **Run Inference**:
@@ -91,38 +90,15 @@ If you need to retrain the model with custom data, follow the comprehensive tuto
 
 ### Using Pre-trained Weights (Inference Only)
 ```python
-# Example code snippet for using EvoFill with pre-trained weights
-from evofill import EvoFillModel
 
-# Initialize the model with pre-trained weights
-model = EvoFillModel.from_pretrained("yourusername/evofill")
 
-# Perform imputation directly (no training required)
-imputed_genotypes = model.impute(test_data_path)
 
-# Save results
-model.save_results(imputed_genotypes, output_path)
 ```
 
 ### Training from Scratch
 ```python
-# Example code snippet for training EvoFill
-from evofill import EvoFillModel
 
-# Initialize the model
-model = EvoFillModel()
 
-# Train the model
-model.train(training_data_path)
-
-# Save the trained model
-model.save("path/to/save/model")
-
-# Perform imputation
-imputed_genotypes = model.impute(test_data_path)
-
-# Save results
-model.save_results(imputed_genotypes, output_path)
 ```
 
 ## 📈 Performance
