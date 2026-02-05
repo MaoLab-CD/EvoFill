@@ -1,6 +1,6 @@
 # EvoFill: Evolution-aware state space model for genotype imputation
 
-![GitHub](https://img.shields.io/github/license/yourusername/EvoFill)
+![GitHub](https://img.shields.io/github/license/MaoLab-CD/EvoFill)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 
 ## 📋 Project Overview
