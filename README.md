@@ -7,11 +7,10 @@ EvoFill is an advanced genotype imputation tool that leverages an evolution-awar
 
 
 ### Key Features
-- **Evolution-aware modeling**: Utilizes evolutionary history to improve imputation accuracy
-- **State space model**: Employs advanced statistical methods for precise genotype prediction
-- **Efficient implementation**: Optimized for both speed and memory usage
-- **Pre-trained weights**: Available on Hugging Face for immediate inference without training
-
+- **State space model**: Built on Mamba-2 architecture with linear complexity
+- **Multi-panel compatibility**: Supports various sequencing panels (WGS, 1240k, etc.)
+- **Evolution-aware loss**: Incorporates evolutionary information for better imputation
+- **Public weights**: Pre-trained weights available without requiring original genetic data
 
 
 ## 1. Installation and Configuration
@@ -24,12 +23,21 @@ git clone https://github.com/MaoLab-CD/EvoFill.git
 
 #### 1.2 Configuration Using Conda Virtual Environment
 
+EvoFill is developed under the following environment:
+```
+Python ver:     3.10.19
+Pytorch ver:    2.8.0
+CUDA ver:       12.9
+Mamba ver:      2.2.5
+Deepspeed ver:  0.17.5
+```
+
+For complete environment configuration:  
 ```bash
 # Create and activate the conda environment
 conda create -n evofill -f env.yml
 conda activate evofill
 ```
-
 
 
 ## 2. Imputation 
@@ -49,7 +57,7 @@ The following files are available and can be obtained from [Hugging Face - EvoFi
 
 Make sure your VCF files are properly formatted and ready for imputation. You will need to place the VCF files into the appropriate directory (e.g., `input_vcf/`). 
 
-#### 2.3 **Ensure Your File Structure is as Follows** 
+#### 2.3 **Ensure File Structure** 
 
 Placing downloaded files in corresponding folder：
 
