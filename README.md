@@ -38,11 +38,12 @@ In this tutorial, we take **human chromosome 22 (hg38)** as an example, imputati
 
 #### 2.1 **Download Pre-trained Weights**:
 
-The following files are available and can be obtained from [Hugging Face - EvoFill](https://huggingface.co/maolab-cd/EvoFill):
+The following files are available and can be obtained from [Hugging Face - EvoFill](https://huggingface.co/maolab-cd/EvoFill/tree/main/hg38_chr22):
 
 - `hg38_chr22_v1.0.bin`
 - `model_meta.json`
 - `gt_enc_meta.json`
+
 
 #### 2.2 **Prepare VCF Files for Imputation** 
 
@@ -54,66 +55,62 @@ Placing downloaded files in corresponding folder：
 
 ```markdown
 EvoFill/
-├── src/                        # EvoFill Source code
+├── src/                        # Source code in GitHub
 ├── models/
-│   ├── hg38_chr22_v1.0.bin     # Model weights
-│   └── model_meta.json         # Model configuration
+│   ├── hg38_chr22_v1.0.bin     # Model weights from Hugging Face
+│   └── model_meta.json         # Model configuration from Hugging Face
+│   └── gt_enc_meta.json        # Encoder metadata from Hugging Face
 ├── data/
 │   └── masked_vcf/             # Your vcf
-├── train/
-│   └── gt_enc_meta.json        # Encoder metadata used during training
 └── tutorial_imputation.ipynb
 └── ...
 ```
 
 #### 2.4 **Run Inference**:
 
-To perform imputation,  follow the step in `tutorial_imputation.ipynb`. 
+To perform imputation,  follow the step in **[tutorial_imputation.ipynb](tutorial_imputation.ipynb)**. 
 
 
 
 ## 3. Training
 
+To reproduce the 2-stage training protocol in our paper, please follow the steps:
 
-1. **Partition Dataset**:
-   - Split the 1000 Genomes Project dataset into training (major populations) and test (under-represented populations) sets: `notebook/1kGP_partition.ipynb`
+1. **Dataset Partition**:
+   - Split the 1000 Genomes Project (1kGP) dataset into training (dominate populations) and test (underrepresented population, CDX in our case) sets: **[notebook/1kGP_partition.ipynb](notebook/1kGP_partition.ipynb)**
 
-   - Prepare 1240k-panel Sampless from multiple sources: `notebook/merge_1240k_samples.ipynb`
+   - Prepare 1240k-panel Sampless from multiple sources: **[notebook/merge_1240k_samples.ipynb](notebook/merge_1240k_samples.ipynb)**
      - AADR (Ancient DNA Database)
-     - Shimao (石峁) samples
-     - Tibetan samples
+     - Shimao Archaeological Site (石峁遗址) samples
+     - Modern Tibetan samples
 
-2. **Model Training**: 
+2. **2-stage training**: 
 
-   - please refer to: `tutorial_training.ipynb`. 
-
+   - please refer to: **[tutorial_training.ipynb](tutorial_training.ipynb)**. 
 
 
 ## 4. Documentation
 
-- **Notebooks Directory**: Contains various utility notebooks for data preparation and analysis
+- **Source Code**: Implementation of the EvoFill backbone
+  - `src/model.py`: EvoFill backbone implementation
+  - `src/data.py`: Data loading and preprocessing
+  - `src/utils.py`: Utility functions
+  - `src/eval_metrics.py`: Evaluation metrics
+
+- **Notebooks Directory**: notebooks for data preparation and custom analysis
   - `notebook/1kGP_partition.ipynb`: Splits 1000 Genomes Project dataset into training and test sets
   - `notebook/merge_1240k_samples.ipynb`: Merges Asian and Southeastern Asian samples for augmentation
   - `notebook/Compare_summary.ipynb`: Compares imputation results
   - `notebook/Eval_summary.ipynb`: Evaluates model performance
   - `notebook/functional_region_analysis.ipynb`: Analyzes performance in functional genomic regions
 
-- **Source Code**: Detailed implementation of the EvoFill model
-  - `src/model.py`: Core model implementation
-  - `src/data.py`: Data loading and preprocessing
-  - `src/utils.py`: Utility functions
-  - `src/eval_metrics.py`: Evaluation metrics
 
+## 5. Cite
 
-
-## 5. Performance
-
-EvoFill has been extensively evaluated on various datasets, showing significant improvements over traditional imputation methods, particularly for under-represented populations. Detailed performance metrics are available in the project's associated publication.
-
+*under review*
 
 
 ## 6. License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
+This project is licensed under the MIT License 
 
