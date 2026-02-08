@@ -53,8 +53,8 @@ class GenotypeEncoder:
             else:
                 print("[DATA] save_dir is not given")
         
-        print(f'[DATA] 位点矩阵 = {self.X_gt.shape}，稀疏度 = {self.X_gt.nnz / self.X_gt.shape[0] / self.X_gt.shape[1]:.2%}')
-        print(f'[DATA] 位点字典 = {self.hap_map}，字典深度 = {self.seq_depth}')
+        print(f'[DATA] Genotype matrix = {self.X_gt.shape}, sparsity = {self.X_gt.nnz / self.X_gt.shape[0] / self.X_gt.shape[1]:.2%}')
+        print(f'[DATA] Genotype dictionary = {self.hap_map}, dictionary depth = {self.seq_depth}')
         return self
 
     # ========= 3. 参照编码：必须 100 % 一致 =========
@@ -89,8 +89,9 @@ class GenotypeEncoder:
                 print("[DATA] save_dir is not given")
         
         miss_rate = np.sum((self.X_gt.data == - 1)) 
-        print(f'[DATA] 位点矩阵 = {self.X_gt.shape}，稀疏度 = {self.X_gt.nnz / self.X_gt.shape[0] / self.X_gt.shape[1]:.2%}，缺失率 = {miss_rate / self.X_gt.shape[0] / self.X_gt.shape[1]:.2%}')
-        print(f'[DATA] 位点字典 = {self.hap_map}，字典深度 = {self.seq_depth}')
+        print(f'[DATA] Genotype matrix = {self.X_gt.shape}, sparsity = {self.X_gt.nnz / self.X_gt.shape[0] / self.X_gt.shape[1]:.2%}, missing rate = {miss_rate / self.X_gt.shape[0] / self.X_gt.shape[1]:.2%}')
+        print(f'[DATA] Genotype dictionary = {self.hap_map}, dictionary depth = {self.seq_depth}')
+
         return self
 
     # ========= 4. 内部工具：encode_gt 仅增加“参照模式”判断 =========
@@ -175,8 +176,8 @@ class GenotypeEncoder:
             self.n_variants += 1
             self.variant_ids.append(f"{rec.CHROM}:{rec.POS}_{rec.REF}/{','.join(rec.ALT)}")
             if self.n_variants % interval == 0:
-                print(f'\r[DATA] 已编码 {self.n_variants:,} 个位点', end='', flush=True)
-        print(f'\r[DATA] 总计 {self.n_variants:,} 个位点  ', flush=True)
+                print(f'\r[DATA] Encoded {self.n_variants:,} variants', end='', flush=True)
+        print(f'\r[DATA] Total {self.n_variants:,} variants  ', flush=True)
         vcf.close()
         n_rows = 2 * self.n_samples if self.phased else self.n_samples
         M = sp.csc_matrix((data, cols, indptr), shape=(n_rows, self.n_variants), dtype=np.int8)
@@ -230,7 +231,8 @@ class GenotypeEncoder:
         with open(os.path.join(self.save_dir, "gt_variants.txt"), "w") as f:
             for vid in self.variant_ids:
                 f.write(vid + "\n")
-        print(f"[DATA] 结果已写入 {self.save_dir}")
+        print(f"[DATA] Results have been written to {self.save_dir}")
+
 
 
     def gts_toarray(self, idx=None):

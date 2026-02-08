@@ -195,7 +195,7 @@ if __name__ == "__main__":
     DEVICE = 'cpu'       # 无 GPU 也能跑
 
     # ---------- 1. 构造不带缺失的数据 ----------
-    print('=== 测试 1：y_true 不含缺失 ===')
+    print('=== Test 1：y_true does not contain missing values ===')
     y_true_clean = torch.zeros(BATCH_SIZE, N_LOCUS, N_CLASS, device=DEVICE)
     # 随机 one-hot
     for b in range(BATCH_SIZE):
@@ -214,7 +214,7 @@ if __name__ == "__main__":
     print('logs =', logs)
 
     # ---------- 2. 构造带缺失的数据 ----------
-    print('\n=== 测试 2：y_true 含缺失 ===')
+    print('\n=== Test 2：y_true contains missing values ===')
     N_CLASS_FULL = N_CLASS + 1
     y_true_missing = torch.zeros(BATCH_SIZE, N_LOCUS, N_CLASS_FULL, device=DEVICE)
     for b in range(BATCH_SIZE):

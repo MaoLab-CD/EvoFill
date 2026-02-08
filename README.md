@@ -1,77 +1,95 @@
 # EvoFill: Evolution-aware state space model for genotype imputation
 
-![Python](https://img.shields.io/badge/python-3.8%2B-blue)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
-## 📋 Project Overview
+EvoFill is an advanced genotype imputation tool that leverages an evolution-aware state space model to accurately impute missing genetic variants. 
 
-EvoFill is an advanced genotype imputation tool that leverages an evolution-aware state space model to accurately impute missing genetic variants. By incorporating evolutionary information into the imputation process, EvoFill achieves superior performance, especially for under-represented populations.
+
 
 ### Key Features
 - **Evolution-aware modeling**: Utilizes evolutionary history to improve imputation accuracy
 - **State space model**: Employs advanced statistical methods for precise genotype prediction
-- **Population-specific optimization**: Performs particularly well for under-represented populations
 - **Efficient implementation**: Optimized for both speed and memory usage
 - **Pre-trained weights**: Available on Hugging Face for immediate inference without training
-- **Easy to use**: Simple API for both inference and training
 
-## 🚀 Installation and Configuration
 
-### Using Conda Virtual Environment
+
+## 1. Installation and Configuration
+
+#### 1.1 Clone repository 
+
+```
+git clone https://github.com/MaoLab-CD/EvoFill.git
+```
+
+#### 1.2 Configuration Using Conda Virtual Environment
+
 ```bash
 # Create and activate the conda environment
 conda create -n evofill -f env.yml
 conda activate evofill
 ```
 
-### Using Docker
-```bash
-# Build the Docker image
-docker build -t evofill .
 
-# Run the container
-docker run -it --rm evofill
+
+## 2. Imputation 
+
+In this tutorial, we take **human chromosome 22 (hg38)** as an example, imputation can be performed by following the steps. 
+
+#### 2.1 **Download Pre-trained Weights**:
+
+The following files are available and can be obtained from [Hugging Face - EvoFill](https://huggingface.co/maolab-cd/EvoFill):
+
+- `hg38_chr22_v1.0.bin`
+- `model_meta.json`
+- `gt_enc_meta.json`
+
+#### 2.2 **Prepare VCF Files for Imputation** 
+
+Make sure your VCF files are properly formatted and ready for imputation. You will need to place the VCF files into the appropriate directory (e.g., `masked_vcf/`). 
+
+#### 2.3 **Ensure Your File Structure is as Follows** 
+
+Placing downloaded files in corresponding folder：
+
+```markdown
+EvoFill/
+├── src/                        # EvoFill Source code
+├── models/
+│   ├── hg38_chr22_v1.0.bin     # Model weights
+│   └── model_meta.json         # Model configuration
+├── data/
+│   └── masked_vcf/             # Your vcf
+├── train/
+│   └── gt_enc_meta.json        # Encoder metadata used during training
+└── tutorial_imputation.ipynb
+└── ...
 ```
 
-## 📁 Dataset Preparation
+#### 2.4 **Run Inference**:
 
-### Required Only for Training from Scratch
-Dataset preparation is only necessary if you plan to retrain the model. When using pre-trained weights from Hugging Face, **no training datasets are required**.
+To perform imputation,  follow the step in `tutorial_imputation.ipynb`. 
 
-If you need to retrain the model, follow these steps:
 
-1. **Partition 1kGP Dataset**:
-   - Split the 1000 Genomes Project dataset into training (major populations) and test (under-represented populations) sets
-   - Use the provided notebook: `notebook/1kGP_partition.ipynb`
 
-2. **Prepare 1240k-panel Samples**:
-   - Merge Asian and Southeastern Asian samples from multiple sources:
+## 3. Training
+
+
+1. **Partition Dataset**:
+   - Split the 1000 Genomes Project dataset into training (major populations) and test (under-represented populations) sets: `notebook/1kGP_partition.ipynb`
+
+   - Prepare 1240k-panel Sampless from multiple sources: `notebook/merge_1240k_samples.ipynb`
      - AADR (Ancient DNA Database)
      - Shimao (石峁) samples
      - Tibetan samples
-   - Use the provided notebook: `notebook/merge_1240k_samples.ipynb`
 
-## 📖 Tutorial
+2. **Model Training**: 
 
-### Using Pre-trained Weights (Recommended)
-EvoFill can directly use pre-trained weights from Hugging Face for inference, eliminating the need for training from scratch:
+   - please refer to: `tutorial_training.ipynb`. 
 
-1. **Download Pre-trained Weights**:
-   - Access the model weights on Hugging Face: [EvoFill Model](https://huggingface.co/syaoran036/EvoFill)
-   - Follow the instructions to download and load the weights
 
-2. **Run Inference**:
-   - Use the pre-trained model directly for genotype imputation
-   - No training dataset required
 
-### Training from Scratch
-If you need to retrain the model with custom data, follow the comprehensive tutorial notebook:
-
-- **Main Tutorial**: `tuorial.ipynb`
-  - Step-by-step guide for model training
-  - Imputation workflow
-  - Result evaluation and interpretation
-
-## 📚 Documentation
+## 4. Documentation
 
 - **Notebooks Directory**: Contains various utility notebooks for data preparation and analysis
   - `notebook/1kGP_partition.ipynb`: Splits 1000 Genomes Project dataset into training and test sets
@@ -86,36 +104,15 @@ If you need to retrain the model with custom data, follow the comprehensive tuto
   - `src/utils.py`: Utility functions
   - `src/eval_metrics.py`: Evaluation metrics
 
-## 🔬 Usage Example
-
-### Using Pre-trained Weights (Inference Only)
-```python
 
 
-
-```
-
-### Training from Scratch
-```python
-
-
-```
-
-## 📈 Performance
+## 5. Performance
 
 EvoFill has been extensively evaluated on various datasets, showing significant improvements over traditional imputation methods, particularly for under-represented populations. Detailed performance metrics are available in the project's associated publication.
 
-## 🤝 Contributing
 
-We welcome contributions to EvoFill! If you're interested in contributing, please follow these steps:
 
-1. Fork the repository
-2. Create a new branch for your feature
-3. Commit your changes
-4. Push to the branch
-5. Open a pull request
-
-## 📄 License
+## 6. License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 

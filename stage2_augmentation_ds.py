@@ -89,8 +89,9 @@ train_ds = GenomicDataset_AlignedMask(
     indices=None
 )
 
-pprint(f"1KGP 总位点数    : {train_ds.n_total:,}, \n"
-        f"1240K 共享位点数: {train_ds.n_shared:,} ({train_ds.n_shared/train_ds.n_total:.1%})")
+pprint(f"1KGP Total variants    : {train_ds.n_total:,}, \n"
+       f"1240K Shared variants: {train_ds.n_shared:,} ({train_ds.n_shared/train_ds.n_total:.1%})")
+
 
 augment_idx, val_idx = train_test_split(
     range(gt_enc_val.n_samples),

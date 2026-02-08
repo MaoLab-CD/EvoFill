@@ -514,13 +514,13 @@ if __name__ == '__main__':
     model = EvoFill(A, L, chunk_size, overlap, d_model, d_state, headdim, bimamba_layers=bimamba_layers, stack_mamba_layers=stack_mamba_layers).to(device)
     print(f"model chunks: {model.n_chunks}")
 
-    print("单 chunk 测试")
+    print("Single chunk test")
     cid = 0
     model.global_out.set_ulr_enabled(False)
     logits, prob, mask_idx = model(x_train, cid)
     print(prob.shape)
-
-    print("多 chunk 测试")
+    
+    print("Multi chunk test")
     cids= [0,2]
     model.global_out.set_ulr_enabled(True)
     logits, prob, mask_idx = model(x_train, cid)

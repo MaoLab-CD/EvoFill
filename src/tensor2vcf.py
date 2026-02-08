@@ -86,7 +86,7 @@ def make_imputed_vcfgz_from_prob(prob_npy, mask_vcf_gz, out_vcfgz, digits=4):
     header_lines = add_format_headers_if_missing(header_lines)
 
     fmt_field = "GT:DS:GP"  # 固定顺序：DS 必须在第二列（适配你不改评估脚本）
-    gt_map = np.array(["0|0", "0|1", "1|1"], dtype=object)
+    gt_map = np.array(["0/0", "0/1", "1/1"], dtype=object)
     ffmt = lambda x: format(float(x), f".{digits}f")
 
     print("[INFO] Writing plain VCF:", out_plain)
@@ -140,4 +140,12 @@ def make_imputed_vcfgz_from_prob(prob_npy, mask_vcf_gz, out_vcfgz, digits=4):
 
     return out_vcfgz
 
+PROB_NPY = "/mnt/qmtang/EvoFill_data/20251211_chr22/impute_out2/impute_prob.npy"
+MASK_VCF = "/mnt/qmtang/EvoFill_data/20251211_chr22/data/major_pops_val.mask90p.vcf.gz"
 
+OUT_VCFGZ = "/home/zqyin/mamba_test/Other_Model_test/chr22_major/Evofill/major_pops_val.imputed.from_prob.vcf.gz"
+
+FLOAT_DIGITS = 4  # DS/GP 保留小数位
+
+OUT_VCFGZ_CREATED = make_imputed_vcfgz_from_prob(PROB_NPY, MASK_VCF, OUT_VCFGZ, digits=4)
+OUT_VCFGZ_CREATED
