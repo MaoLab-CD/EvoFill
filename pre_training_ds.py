@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Stage-1 训练脚本
-DeepSpeed ZeRO-3 多卡并行
-运行：
-    OMP_NUM_THREADS=8 accelerate launch --config_file ds_zero3.yaml train_stage1_deepspeed.py
+Stage-1 PreTraining
+DeepSpeed ZeRO-3
+Run：
+    OMP_NUM_THREADS=8 accelerate launch --config_file ds_zero3.yaml pre_training_ds.py
 """
 import math
 import torch
@@ -25,8 +25,8 @@ from src.loss_v1 import ImputationLoss
 from src.utils import find_latest_ckpt
 
 # ================= 1. 超参数 =================
-MODEL_NAME         = "hg38_chr22_IGL"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251225_chr22_IGL/')
+MODEL_NAME         = "hg38_chr22"
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251225_chr22/')
 PRETRAIN_DIR       = WORK_DIR / "train"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 

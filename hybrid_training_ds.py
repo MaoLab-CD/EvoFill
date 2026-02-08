@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-训练脚本
-DeepSpeed ZeRO-3 多卡并行
-运行：
-    OMP_NUM_THREADS=8 accelerate launch --config_file ds_zero3.yaml ds_training.py
+Stage-2 Hybrid Training
+DeepSpeed ZeRO-3
+Run：
+    OMP_NUM_THREADS=8 accelerate launch --config_file ds_zero3.yaml hybrid_training_ds.py
 """
 import math
 import torch
@@ -104,8 +104,8 @@ train_1kgp_panel = GenomicDataset_AlignedMask(
     indices=None
 )
 
-pprint(f"1KGP 总位点数    : {train_1kgp_panel.n_total:,}, \n"
-        f"1240K 共享位点数: {train_1kgp_panel.n_shared:,} ({train_1kgp_panel.n_shared/train_1kgp_panel.n_total:.1%})")
+pprint(f"1KGP Total variants   : {train_1kgp_panel.n_total:,}, \n"
+        f"1240K Shared variants: {train_1kgp_panel.n_shared:,} ({train_1kgp_panel.n_shared/train_1kgp_panel.n_total:.1%})")
 
 # 3. 分割验证集（按比例分配各类型样本）
 # 总验证样本数: VAL_N_SAMPLES = 1000
@@ -119,10 +119,10 @@ val_panel_samples = int(VAL_N_SAMPLES * HYBRID_RATIO[1])
 val_1240k_samples = VAL_N_SAMPLES - val_1kgp_samples - val_panel_samples
 
 # 打印数据集大小信息
-pprint("数据集大小信息:")
-pprint(f"  1KGP训练样本总数: {len(train_1kgp_random)}")
-pprint(f"  1KGP panel训练样本总数: {len(train_1kgp_panel)}")
-pprint(f"  1240K训练样本总数: {gt_enc_aug.n_samples}")
+pprint("Dataset Information:")
+pprint(f"  1KGP Total samples: {len(train_1kgp_random)}")
+pprint(f"  1KGP panel Total samples: {len(train_1kgp_panel)}")
+pprint(f"  1240K Total samples: {gt_enc_aug.n_samples}")
 
 # 分割1240K数据集为训练和验证
 augment_idx, val_1240k_idx = train_test_split(
@@ -207,14 +207,14 @@ val_sampler = MixedRatioSampler(
 train_mixed_ds = MixedDataset([train_1kgp_random, train_1kgp_panel, augment_ds], None)
 val_mixed_ds = MixedDataset([val_1kgp_random, val_1kgp_panel, val_1240k], val_sampler)
 
-pprint(f"Train 混合数据集: {HYBRID_RATIO[0]*100:.1f}% 1KGP随机mask + {HYBRID_RATIO[1]*100:.1f}% 1KGP panel + {HYBRID_RATIO[2]*100:.1f}% 1240K\n"
-        f"Val   混合数据集: {HYBRID_RATIO[0]*100:.1f}% 1KGP随机mask + {HYBRID_RATIO[1]*100:.1f}% 1KGP panel + {HYBRID_RATIO[2]*100:.1f}% 1240K\n"
-        f"每轮训练样本数: {TRAIN_N_SAMPLES}\n"
-        f"验证样本数: {VAL_N_SAMPLES}\n"
-        f"批次大小: {BATCH_SIZE} (每个批次的样本来自同一数据集类型)\n"
-        f"1KGP 训练样本总数: {gt_enc_train.n_samples:,}\n"
-        f"1240K 训练样本总数: {len(augment_idx):,}\n"
-        f"注: 为确保evo_mat有效性，每个批次的{BATCH_SIZE}个样本来自同一数据集类型")
+# pprint(f"Train 混合数据集: {HYBRID_RATIO[0]*100:.1f}% 1KGP随机mask + {HYBRID_RATIO[1]*100:.1f}% 1KGP panel + {HYBRID_RATIO[2]*100:.1f}% 1240K\n"
+#         f"Val   混合数据集: {HYBRID_RATIO[0]*100:.1f}% 1KGP随机mask + {HYBRID_RATIO[1]*100:.1f}% 1KGP panel + {HYBRID_RATIO[2]*100:.1f}% 1240K\n"
+#         f"每轮训练样本数: {TRAIN_N_SAMPLES}\n"
+#         f"验证样本数: {VAL_N_SAMPLES}\n"
+#         f"批次大小: {BATCH_SIZE} (每个批次的样本来自同一数据集类型)\n"
+#         f"1KGP 训练样本总数: {gt_enc_train.n_samples:,}\n"
+#         f"1240K 训练样本总数: {len(augment_idx):,}\n"
+#         f"注: 为确保evo_mat有效性，每个批次的{BATCH_SIZE}个样本来自同一数据集类型")
 
 #  -------------- URP 测试集
 imp_dataset = ImputationDataset(
