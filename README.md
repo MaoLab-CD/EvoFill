@@ -40,14 +40,14 @@ In this tutorial, we take **human chromosome 22 (hg38)** as an example, imputati
 
 The following files are available and can be obtained from [Hugging Face - EvoFill](https://huggingface.co/maolab-cd/EvoFill/tree/main/hg38_chr22):
 
-- `hg38_chr22_v1.0.bin`
-- `model_meta.json`
-- `gt_enc_meta.json`
+- `hg38_chr22_v1.0.bin`: Model weights
+- `model_meta.json`: Model configuration
+- `gt_enc_meta.json`: Encoder metadata 
 
 
 #### 2.2 **Prepare VCF Files for Imputation** 
 
-Make sure your VCF files are properly formatted and ready for imputation. You will need to place the VCF files into the appropriate directory (e.g., `masked_vcf/`). 
+Make sure your VCF files are properly formatted and ready for imputation. You will need to place the VCF files into the appropriate directory (e.g., `input_vcf/`). 
 
 #### 2.3 **Ensure Your File Structure is as Follows** 
 
@@ -57,11 +57,11 @@ Placing downloaded files in corresponding folder：
 EvoFill/
 ├── src/                        # Source code in GitHub
 ├── models/
-│   ├── hg38_chr22_v1.0.bin     # Model weights from Hugging Face
-│   └── model_meta.json         # Model configuration from Hugging Face
-│   └── gt_enc_meta.json        # Encoder metadata from Hugging Face
+│   ├── hg38_chr22_v1.0.bin
+│   ├── model_meta.json
+│   └── gt_enc_meta.json
 ├── data/
-│   └── masked_vcf/             # Your vcf
+│   └── input_vcf/              # Your vcf
 └── tutorial_imputation.ipynb
 └── ...
 ```
@@ -97,10 +97,9 @@ To reproduce the 2-stage training protocol in our paper, please follow the steps
   - `src/utils.py`: Utility functions
   - `src/eval_metrics.py`: Evaluation metrics
 
-- **Notebooks Directory**: notebooks for data preparation and custom analysis
+- **Notebooks**: notebooks for analysis in our paper
   - `notebook/1kGP_partition.ipynb`: Splits 1000 Genomes Project dataset into training and test sets
-  - `notebook/merge_1240k_samples.ipynb`: Merges Asian and Southeastern Asian samples for augmentation
-  - `notebook/Compare_summary.ipynb`: Compares imputation results
+  - `notebook/merge_1240k_samples.ipynb`: Merges 1240k-panel samples for augmentation
   - `notebook/Eval_summary.ipynb`: Evaluates model performance
   - `notebook/functional_region_analysis.ipynb`: Analyzes performance in functional genomic regions
 
