@@ -26,7 +26,7 @@ from src.utils import find_latest_ckpt
 
 # ================= 1. 超参数 =================
 MODEL_NAME         = "hg38_chr22"
-WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251225_chr22/')
+WORK_DIR           = Path('/mnt/qmtang/EvoFill_data/20251230_chr22/')
 PRETRAIN_DIR       = WORK_DIR / "train"
 MODEL_SAVE_DIR     = WORK_DIR / "models"
 

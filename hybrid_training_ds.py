@@ -272,8 +272,8 @@ model_raw = EvoFill(
                     stack_mamba_layers=int(meta["stack_mamba_layers"])
                 ).to(device)
 
-state_dict = torch.load("/mnt/qmtang/EvoFill_data/20251211_chr22/models/pytorch_model_stage1.bin", map_location="cpu")
-model_raw.load_state_dict(state_dict)
+# state_dict = torch.load("/mnt/qmtang/EvoFill_data/20251211_chr22/models/pytorch_model_stage1.bin", map_location="cpu")
+# model_raw.load_state_dict(state_dict)
 
 # -------------- 4. 优化器 --------------
 optimizer = AdamW(model_raw.parameters(), lr=LR, betas=BETAS, weight_decay=WD)
@@ -318,6 +318,26 @@ model, *opt_sch = accelerator.prepare(
 )
 optimizer, scheduler = opt_sch[:2]
 
+stage1_last = find_latest_ckpt(MODEL_SAVE_DIR, prefix="checkpoint-stage1-")
+
+if stage1_last is not None:
+    pprint(f"Find stage 1 checkpoint: {stage1_last.name}, loading state...")
+    accelerator.load_state(stage1_last)
+
+    # 把 best_loss / patience_counter / start_epoch 读回来
+    meta_json = stage1_last / "training_meta.json"
+    if meta_json.exists():
+        with open(meta_json, "r") as f:
+            meta = json.load(f)
+        start_epoch = 0
+        best_loss = math.inf
+        patience_counter = 0
+    pprint(f"Successfully resume from stage 1 , best_loss={best_loss:.4f}, patience={patience_counter}")
+else:
+    pprint("No stage 1 checkpoint found, exit.")
+    exit(1)
+
+
 latest_ckpt = find_latest_ckpt(MODEL_SAVE_DIR, prefix="checkpoint-stage2-")
 
 if latest_ckpt is not None:
@@ -337,7 +357,7 @@ else:
     start_epoch = 0
     best_loss = math.inf
     patience_counter = 0
-    pprint("No checkpoint found, train from scratch.")
+    pprint("No checkpoint found, train from stage 1.")
 
 # -------------- 6. Loss --------------
 criterion = ImputationLoss(use_r2=True, use_evo=True)
